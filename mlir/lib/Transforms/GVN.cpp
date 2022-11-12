@@ -69,7 +69,7 @@ struct DeadExpr;
 class WithID {
   unsigned id = 0;
   public:
-  unsigned getID() const { return id; }
+  unsigned getID() { return id; }
   void setID(unsigned i) { id = i; }
 };
 
@@ -133,9 +133,9 @@ protected:
 
   /// This is usually a Value but it can be an Attribute if the Expr represent a
   /// constant
-  const OpFoldResult current;
-  const ExprKind kind : 3;
-  const unsigned numOperands : 29;
+  OpFoldResult current;
+  ExprKind kind : 3;
+  unsigned numOperands : 29;
 
   Expr(ExprKind k, Value orig, OpFoldResult curr,
        ArrayRef<Expr *> operands = {})
@@ -144,9 +144,6 @@ protected:
   /// The space for operands is allocated before the Expr
   ExprOperand *getOperandsStart() {
     return reinterpret_cast<ExprOperand *>(this) - numOperands;
-  }
-  ExprOperand *getOperandsStart() const {
-    return const_cast<Expr *>(this)->getOperandsStart();
   }
   void setOperands(ArrayRef<Expr *> operands) {
     assert(operands.size() == numOperands);
@@ -157,7 +154,7 @@ protected:
     }
   }
 
-  bool isOperandEqual(const Expr *other) const {
+  bool isOperandEqual(Expr *other) {
     if (getOperands().size() != other->getOperands().size())
       return false;
     for (unsigned idx = 0; idx < getOperands().size(); idx++)
@@ -167,39 +164,36 @@ protected:
   }
 
 public:
-  bool isInitial() const { return !original; }
-  Location getOrigLoc() const { return original.getLoc(); }
+  bool isInitial() { return !original; }
+  Location getOrigLoc() { return original.getLoc(); }
   ExprKind getKind() const { return kind; }
   CongruenceClass *cClass = nullptr;
   MutableArrayRef<ExprOperand> getOperands() {
     return {getOperandsStart(), numOperands};
   }
-  ArrayRef<ExprOperand> getOperands() const {
-    return {getOperandsStart(), numOperands};
-  }
 
-  unsigned getCurrIdx() const {
+  unsigned getCurrIdx() {
     if (auto currRes = dyn_cast_if_present<OpResult>(getCurrVal()))
       return currRes.getResultNumber();
     return 0;
   }
-  CongruenceClass *getParent() const { return cClass; }
-  unsigned getHash() const { return hash; }
-  Value getOriginal() const { return original; }
-  OpFoldResult getCurrent() const { return current; }
-  Value getCurrVal() const { return current.dyn_cast<Value>(); }
-  Operation *getCurrOp() const {
+  CongruenceClass *getParent() { return cClass; }
+  unsigned getHash() { return hash; }
+  Value getOriginal() { return original; }
+  OpFoldResult getCurrent() { return current; }
+  Value getCurrVal() { return current.dyn_cast<Value>(); }
+  Operation *getCurrOp() {
     if (auto val = getCurrVal())
       return val.getDefiningOp();
     return nullptr;
   }
-  Attribute getCurrAttr() const { return current.dyn_cast<Attribute>(); }
-  bool isEqual(const Expr *other) const;
-  void print(raw_ostream &os) const;
-  void printAsValue(raw_ostream &os) const {
+  Attribute getCurrAttr() { return current.dyn_cast<Attribute>(); }
+  bool isEqual(Expr *other);
+  void print(raw_ostream &os);
+  void printAsValue(raw_ostream &os) {
     os << "Expr(" << getID() << ")";
   }
-  LLVM_DUMP_METHOD void dump() const { return print(llvm::errs()); }
+  LLVM_DUMP_METHOD void dump() { return print(llvm::errs()); }
   /// Dispatch the lambda to the correct subclass of Expr
   template <typename RetTy = void, typename T = void>
   static RetTy dispatchToImpl(Expr *e, T &&callable) {
@@ -248,7 +242,7 @@ struct GenericOpExpr : Expr {
   }
 public:
   static bool classof(const Expr *e) { return e->getKind() == Expr::generic; }
-  bool isEqual(const GenericOpExpr *other) {
+  bool isEqual(GenericOpExpr *other) {
     if (!isOpActionEqual(getCurrOp(), other->getCurrOp()) ||
         getCurrIdx() != other->getCurrIdx())
       return false;
@@ -263,7 +257,7 @@ struct VariableExpr : Expr {
     hash = llvm::DenseMapInfo<Value>::getHashValue(getOriginal());
   }
   static bool classof(const Expr *e) { return e->getKind() == Expr::variable; }
-  bool isEqual(const VariableExpr *other) { return getOriginal() == other->getOriginal(); }
+  bool isEqual(VariableExpr *other) { return getOriginal() == other->getOriginal(); }
 };
 
 struct DeadExpr : Expr {
@@ -272,11 +266,11 @@ struct DeadExpr : Expr {
     hash = llvm::hash_value(Expr::dead);
   }
   static bool classof(const Expr *e) { return e->getKind() == Expr::dead; }
-  bool isEqual(const DeadExpr *other) { return true; }
+  bool isEqual(DeadExpr *other) { return true; }
 };
 
 struct ShallowExpr : Expr {
-  static Expr *stripShallow(const Expr *exprCst) {
+  static Expr *stripShallow(Expr *exprCst) {
     Expr *expr = const_cast<Expr *>(exprCst);
     auto *maybeShallow = dyn_cast<ShallowExpr>(expr);
     if (!maybeShallow)
@@ -292,7 +286,7 @@ struct ShallowExpr : Expr {
     hash = inner->getHash();
   }
   static bool classof(const Expr *e) { return e->getKind() == Expr::shallow; }
-  bool isEqual(const Expr *other) {
+  bool isEqual(Expr *other) {
     llvm_unreachable("should never be called");
   }
 };
@@ -305,7 +299,7 @@ struct PHIExpr : Expr {
     hash = llvm::hash_combine(kind, original.getParentBlock(), getOperands());
   }
   static bool classof(const Expr *e) { return e->getKind() == Expr::phi; }
-  bool isEqual(const PHIExpr *other) {
+  bool isEqual(PHIExpr *other) {
     return isOperandEqual(other) &&
            original.getParentBlock() == other->original.getParentBlock();
   }
@@ -318,7 +312,7 @@ struct ConstExpr : Expr {
     hash = llvm::hash_combine(kind, getCurrAttr());
   }
   static bool classof(const Expr *e) { return e->getKind() == Expr::constant; }
-  bool isEqual(const ConstExpr *other) {
+  bool isEqual(ConstExpr *other) {
     /// Attribute are uniqued so if they are the same they have the same pointer
     return getCurrAttr() == other->getCurrAttr();
   }
@@ -331,8 +325,12 @@ IRObjectWithUseList<ExprOperand, Expr *> *ExprOperand::getUseList(Expr *value) {
 /// This is used to hash and compare expression that should be merged into the
 /// same congruence class
 struct DenseMapExprUniquer : DenseMapInfo<Expr *> {
-  static unsigned getHashValue(Expr *val) { return val->getHash(); }
-  static bool isEqual(const Expr *lhs, const Expr *rhs) {
+  static unsigned getHashValue(const Expr *val) {
+    return const_cast<Expr *>(val)->getHash();
+  }
+  static bool isEqual(const Expr *lhsCst, const Expr *rhsCst) {
+    Expr *lhs = const_cast<Expr *>(lhsCst);
+    Expr *rhs = const_cast<Expr *>(rhsCst);
     if (lhs == rhs)
       return true;
     if (lhs == getTombstoneKey() || lhs == getEmptyKey() ||
@@ -348,7 +346,7 @@ struct DenseMapExprUniquer : DenseMapInfo<Expr *> {
   }
 };
 
-bool Expr::isEqual(const Expr *other) const {
+bool Expr::isEqual(Expr *other) {
   if (getHash() != other->getHash())
     return false;
   Expr *lhs = ShallowExpr::stripShallow(this);
@@ -406,7 +404,7 @@ void CongruenceClass::print(raw_ostream &os) {
     os << mem << "\n";
 }
 
-void Expr::print(raw_ostream &os) const {
+void Expr::print(raw_ostream &os) {
   os << "Expr{";
   os << getID();
   os << " " << llvm::utohexstr(hash);
@@ -426,7 +424,7 @@ void Expr::print(raw_ostream &os) const {
     os << " inner=";
     se->inner->printAsValue(os);
   }
-  for (const ExprOperand &operand : getOperands()) {
+  for (ExprOperand &operand : getOperands()) {
     os << " ";
     operand.get()->printAsValue(os);
   }
@@ -586,13 +584,13 @@ public:
     assert(res);
     return res;
   }
-  ValOrOp lookupVal(unsigned num) const {
+  ValOrOp lookupVal(unsigned num) {
     assert(num);
     ValOrOp res = numToValOrOp[num];
     assert(!res.isNull());
     return res;
   }
-  NumRange lookupRange(Block *b) const {
+  NumRange lookupRange(Block *b) {
     NumRange r = blockOpRange.lookup(b);
     assert(!r.isInvalid());
     return r;
@@ -609,7 +607,7 @@ public:
     assert(begin != 0 && end != 0);
     touchedValues.reset(begin, end);
   }
-  const BitVector &getTouchedIndexes() const { return touchedValues; }
+  const BitVector &getTouchedIndexes() { return touchedValues; }
   LLVM_DUMP_METHOD void dump() {
     llvm::errs() << "touched ops and vals(" << touchedValues.count() << "):\n";
     for (unsigned num : touchedValues.set_bits()) {
