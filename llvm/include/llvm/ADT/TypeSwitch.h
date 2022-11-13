@@ -142,6 +142,10 @@ public:
     return std::move(*result);
   }
 
+  /// This is added such that users of TypeSwitch may make generic wrappers
+  /// around TypeSwitch without needing special cases for void
+  [[nodiscard]] ResultT getValue() { return *this; }
+
 private:
   /// The pointer to the result of this switch statement, once known,
   /// null before that.
@@ -177,6 +181,10 @@ public:
     if (!foundMatch)
       defaultFn(this->value);
   }
+
+  /// This is added such that users of TypeSwitch may make generic wrappers
+  /// around TypeSwitch without needing special cases for void
+  void getValue() { }
 
 private:
   /// A flag detailing if we have already found a match.

@@ -86,3 +86,16 @@ TEST(TypeSwitchTest, CasesVoid) {
   EXPECT_EQ(0, translate(DerivedD()));
   EXPECT_EQ(-1, translate(DerivedE()));
 }
+
+template <typename RetTy = void, typename FuncT = void>
+RetTy genericUserOfTypeSwitch(Base *base, FuncT &&callable) {
+  return llvm::TypeSwitch<Base *, RetTy>(base)
+      .template Case<DerivedA, DerivedB, DerivedD>(callable)
+      .getValue();
+}
+
+TEST(TypeSwitchTest, getValue) {
+  DerivedA Value;
+  genericUserOfTypeSwitch<void>(&Value, [](auto *) {});
+  EXPECT_EQ(0, genericUserOfTypeSwitch<int>(&Value, [](auto *) { return 0; }));
+}
