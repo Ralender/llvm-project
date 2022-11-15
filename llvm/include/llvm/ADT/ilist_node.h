@@ -79,6 +79,8 @@ private:
   void setNext(ilist_node_impl *N) { node_base_type::setNext(N); }
 
 public:
+  bool isInList() const { return getNext(); }
+
   self_iterator getIterator() { return self_iterator(*this); }
   const_self_iterator getIterator() const { return const_self_iterator(*this); }
 

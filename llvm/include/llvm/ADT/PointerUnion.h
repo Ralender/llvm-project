@@ -18,6 +18,7 @@
 #include "llvm/ADT/DenseMapInfo.h"
 #include "llvm/ADT/PointerIntPair.h"
 #include "llvm/ADT/STLExtras.h"
+#include "llvm/ADT/Hashing.h"
 #include "llvm/Support/Casting.h"
 #include "llvm/Support/PointerLikeTypeTraits.h"
 #include <algorithm>
@@ -198,7 +199,11 @@ public:
   }
 };
 
-template <typename ...PTs>
+template <typename... Ts> hash_code hash_value(PointerUnion<Ts...> PtrUnion) {
+  return hash_value(PtrUnion.getOpaqueValue());
+}
+
+template <typename... PTs>
 bool operator==(PointerUnion<PTs...> lhs, PointerUnion<PTs...> rhs) {
   return lhs.getOpaqueValue() == rhs.getOpaqueValue();
 }
