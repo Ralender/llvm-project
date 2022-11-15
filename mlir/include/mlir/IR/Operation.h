@@ -640,7 +640,7 @@ public:
   // Users
   //===--------------------------------------------------------------------===//
 
-  using user_iterator = ValueUserIterator<use_iterator, OpOperand>;
+  using user_iterator = ValueUserIterator<use_iterator, OpOperand, Operation*>;
   using user_range = iterator_range<user_iterator>;
 
   user_iterator user_begin() { return user_iterator(use_begin()); }

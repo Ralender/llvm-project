@@ -26,7 +26,7 @@ template <typename ValueRangeT>
 class ValueTypeRange;
 
 /// `Block` represents an ordered list of `Operation`s.
-class Block : public IRObjectWithUseList<BlockOperand>,
+class Block : public IRObjectWithUseList<BlockOperand, Operation*>,
               public llvm::ilist_node_with_parent<Block, Region> {
 public:
   explicit Block() = default;

@@ -282,7 +282,7 @@ public:
   // Users
   //===--------------------------------------------------------------------===//
 
-  using user_iterator = ValueUserIterator<use_iterator, OpOperand>;
+  using user_iterator = ValueUserIterator<use_iterator, OpOperand, Operation*>;
   using user_range = iterator_range<user_iterator>;
 
   /// Returns a range of all users.

@@ -195,7 +195,7 @@ unsigned OpResult::getNumTrailing(unsigned numResults) {
 //===----------------------------------------------------------------------===//
 
 /// Provide the use list that is attached to the given block.
-IRObjectWithUseList<BlockOperand> *BlockOperand::getUseList(Block *value) {
+IRObjectWithUseList<BlockOperand, Operation*> *BlockOperand::getUseList(Block *value) {
   return value;
 }
 

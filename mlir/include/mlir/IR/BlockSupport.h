@@ -27,12 +27,12 @@ class Block;
 
 /// A block operand represents an operand that holds a reference to a Block,
 /// e.g. for terminator operations.
-class BlockOperand : public IROperand<BlockOperand, Block *> {
+class BlockOperand : public IROperand<BlockOperand, Block *, Operation*> {
 public:
-  using IROperand<BlockOperand, Block *>::IROperand;
+  using IROperand<BlockOperand, Block *, Operation*>::IROperand;
 
   /// Provide the use list that is attached to the given block.
-  static IRObjectWithUseList<BlockOperand> *getUseList(Block *value);
+  static IRObjectWithUseList<BlockOperand, Operation*> *getUseList(Block *value);
 
   /// Return which operand this is in the BlockOperand list of the Operation.
   unsigned getOperandNumber();
@@ -47,17 +47,17 @@ public:
 /// are embedded into terminator operations. From the operand, we can get the
 /// terminator that contains it, and its parent block is the predecessor.
 class PredecessorIterator final
-    : public llvm::mapped_iterator<ValueUseIterator<BlockOperand>,
+    : public llvm::mapped_iterator<ValueUseIterator<BlockOperand, Operation*>,
                                    Block *(*)(BlockOperand &)> {
   static Block *unwrap(BlockOperand &value);
 
 public:
   /// Initializes the operand type iterator to the specified operand iterator.
-  PredecessorIterator(ValueUseIterator<BlockOperand> it)
-      : llvm::mapped_iterator<ValueUseIterator<BlockOperand>,
+  PredecessorIterator(ValueUseIterator<BlockOperand, Operation*> it)
+      : llvm::mapped_iterator<ValueUseIterator<BlockOperand, Operation*>,
                               Block *(*)(BlockOperand &)>(it, &unwrap) {}
   explicit PredecessorIterator(BlockOperand *operand)
-      : PredecessorIterator(ValueUseIterator<BlockOperand>(operand)) {}
+      : PredecessorIterator(ValueUseIterator<BlockOperand, Operation*>(operand)) {}
 
   /// Get the successor number in the predecessor terminator.
   unsigned getSuccessorIndex() const;

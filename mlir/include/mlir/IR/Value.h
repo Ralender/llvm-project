@@ -37,7 +37,7 @@ namespace detail {
 
 /// The base class for all derived Value classes. It contains all of the
 /// components that are shared across Value classes.
-class alignas(8) ValueImpl : public IRObjectWithUseList<OpOperand> {
+class alignas(8) ValueImpl : public IRObjectWithUseList<OpOperand, Operation*> {
 public:
   /// The enumeration represents the various different kinds of values the
   /// internal representation may take. We use all of the bits from Type that we
@@ -183,7 +183,7 @@ public:
   // Uses
 
   /// This class implements an iterator over the uses of a value.
-  using use_iterator = ValueUseIterator<OpOperand>;
+  using use_iterator = ValueUseIterator<OpOperand, Operation*>;
   using use_range = iterator_range<use_iterator>;
 
   use_iterator use_begin() const { return impl->use_begin(); }
@@ -201,7 +201,7 @@ public:
   //===--------------------------------------------------------------------===//
   // Users
 
-  using user_iterator = ValueUserIterator<use_iterator, OpOperand>;
+  using user_iterator = ValueUserIterator<use_iterator, OpOperand, Operation*>;
   using user_range = iterator_range<user_iterator>;
 
   user_iterator user_begin() const { return use_begin(); }
@@ -244,10 +244,10 @@ inline raw_ostream &operator<<(raw_ostream &os, Value value) {
 
 /// This class represents an operand of an operation. Instances of this class
 /// contain a reference to a specific `Value`.
-class OpOperand : public IROperand<OpOperand, Value> {
+class OpOperand : public IROperand<OpOperand, Value, Operation*> {
 public:
   /// Provide the use list that is attached to the given value.
-  static IRObjectWithUseList<OpOperand> *getUseList(Value value) {
+  static IRObjectWithUseList<OpOperand, Operation*> *getUseList(Value value) {
     return value.getImpl();
   }
 
@@ -258,7 +258,7 @@ private:
   /// Keep the constructor private and accessible to the OperandStorage class
   /// only to avoid hard-to-debug typo/programming mistakes.
   friend class OperandStorage;
-  using IROperand<OpOperand, Value>::IROperand;
+  using IROperand<OpOperand, Value, Operation*>::IROperand;
 };
 
 //===----------------------------------------------------------------------===//
