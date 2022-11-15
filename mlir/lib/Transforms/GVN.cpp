@@ -1,3 +1,44 @@
+//===- GVN.cpp - Global Value Numbering -----------------------------------===//
+//
+// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+//
+// This file implements an optimistic hash based GVN similar to llvm's
+// NewGVN. But it uses different data structures:
+//  - Expressions keep pointers on there original value, current representation
+//    and current class so there is no need for hash map to keep track of it
+//  - Expressions are kept in a intrusive with other expressions in the same
+//    congruence class this way moving expressions between classes (which is
+//    very frequent) is cheap.
+//  - Expression and there operands are allocated in one consecutive block
+//  - The leader of a congruence class is the first expressions in the intrusive
+//    list.
+// It has a few limitation:
+//  - /!\\ It is greatly under tested for now /!\\.
+//  - It cannot handle structured control-flow.
+//  - It does not yet handle associative operations like it should.
+//  - The leader selection is cheap but often not optimal.
+//  - IR editing is still basic. no sinking, hoisting or localized replacement.
+//  - Self validation should be pushed further
+//  - No support for Customizing the GVN behavior around an operation
+//  - It deal with memory pessimistically. assuming every operation that
+//    accesses memory cannot match with anything other then it self.
+//  - Completely ignores predicate informations.
+//  - Lacking phi folding like: phi(op, op) = op(phi, phi)
+//  - A new expression is created every time an Value/Operation is process.
+//    And it is very hard to know that an expression is not used
+//    anymore, because expression use other expression without any use tracking
+//    or ref-counting. so expressions are not deleted until the GVN is done.
+//    this means that memory usage might be high when GVN needs many iterations
+//    until it reaches the fixed-point.
+//
+// It could be a good idea to split GVN into the Analysis part that find the
+// congruence classes and the IR editing part based of the found classes
+//
+//===----------------------------------------------------------------------===//
 
 #include "mlir/IR/Dominance.h"
 #include "mlir/IR/Matchers.h"
@@ -7,8 +48,8 @@
 #include "mlir/IR/UseDefLists.h"
 #include "mlir/IR/Value.h"
 #include "mlir/Interfaces/ControlFlowInterfaces.h"
-#include "mlir/Interfaces/SideEffectInterfaces.h"
 #include "mlir/Interfaces/LoopLikeInterface.h"
+#include "mlir/Interfaces/SideEffectInterfaces.h"
 #include "mlir/Support/TypeID.h"
 #include "mlir/Transforms/FoldUtils.h"
 #include "mlir/Transforms/Passes.h"
@@ -59,24 +100,39 @@ Block *getBlock(ValOrOp voo) {
 
 struct CongruenceClass;
 class Expr;
-struct VariableExpr;
-struct ShallowExpr;
-struct PHIExpr;
-struct GenericOpExpr;
-struct ConstExpr;
-struct DeadExpr;
+class VariableExpr;
+class PHIExpr;
+class GenericOpExpr;
+class ConstExpr;
+class DeadExpr;
 
+/// This is only used for debug. its stores IDs that can be printed when
+/// referring to expressions and congruence classes
 class WithID {
+#ifndef NDEBUG
   unsigned id = 0;
-  public:
-  unsigned getID() { return id; }
+#endif
+
+public:
+  unsigned getID() {
+#ifndef NDEBUG
+    return id;
+#else
+    return 0;
+#endif
+  }
+#ifndef NDEBUG
   void setID(unsigned i) { id = i; }
+#endif
 };
 
-struct ExprOperand : IROperand<ExprOperand, Expr *, Expr *> {
-  using base = IROperand<ExprOperand, Expr *, Expr *>;
-  using base::base;
-  static IRObjectWithUseList<ExprOperand, Expr *> *getUseList(Expr *value);
+class ExprOperand {
+  Expr *expr;
+
+public:
+  ExprOperand(Expr *) {}
+  void set(Expr *newExpr) { expr = newExpr; }
+  Expr *get() const { return expr; }
 };
 
 /// Found by ADL
@@ -84,8 +140,12 @@ llvm::hash_code hash_value(const ExprOperand &value) {
   return llvm::hash_value(value.get());
 }
 
-class Expr : public IRObjectWithUseList<ExprOperand, Expr *>,
-             public llvm::ilist_node_with_parent<Expr, CongruenceClass>,
+/// expressions in the same congruence class are all kept in thee same intrusive
+/// list. The Congruence class stores this list.
+/// expressions should never use the original in the hash or compare because
+/// expressions can get cloned with a new original and need to compared equal
+/// with there clone
+class Expr : public llvm::ilist_node_with_parent<Expr, CongruenceClass>,
              public WithID {
 public:
   enum ExprKind : unsigned {
@@ -94,10 +154,6 @@ public:
 
     /// Merge of control flow
     phi,
-
-    /// An expression with the same hash a comparaison as another. inner
-    /// Expression
-    shallow,
 
     /// Used for external values or as fallback
     variable,
@@ -113,7 +169,6 @@ public:
       // clang-format off
       case generic: return "generic";
       case phi: return "phi";
-      case shallow: return "shallow";
       case variable: return "variable";
       case constant: return "constant";
       case dead: return "dead";
@@ -139,19 +194,23 @@ protected:
 
   Expr(ExprKind k, Value orig, OpFoldResult curr,
        ArrayRef<Expr *> operands = {})
-      : original(orig), current(curr), kind(k), numOperands(operands.size()) {}
+      : original(orig), current(curr), kind(k), numOperands(operands.size()) {
+    initOperands(operands);
+  }
 
   /// The space for operands is allocated before the Expr
   ExprOperand *getOperandsStart() {
     return reinterpret_cast<ExprOperand *>(this) - numOperands;
   }
-  void setOperands(ArrayRef<Expr *> operands) {
+  void initOperand(ExprOperand &op, Expr *expr) {
+    /// initialize all the operands
+    new (&op) ExprOperand(this);
+    op.set(expr);
+  }
+  void initOperands(ArrayRef<Expr *> operands) {
     assert(operands.size() == numOperands);
-    for (unsigned idx = 0; idx < operands.size(); idx++) {
-      /// initialize all the operands
-      new (&getOperands()[idx]) ExprOperand(this);
-      getOperands()[idx].set(operands[idx]);
-    }
+    for (unsigned idx = 0; idx < operands.size(); idx++)
+      initOperand(getOperands()[idx], operands[idx]);
   }
 
   bool isOperandEqual(Expr *other) {
@@ -163,7 +222,20 @@ protected:
     return true;
   }
 
+  void copyFromImpl(Expr *other) {}
+
 public:
+  void verifyInvariance() {
+#ifndef NDEBUG
+    assert(isEqual(this));
+    dispatchToImpl<int>(this, [](auto *expr) {
+      expr->verifyInvarianceImpl();
+      return 0;
+    });
+#endif
+  }
+  struct EmptyTag {};
+  Expr(EmptyTag) {}
   bool isInitial() { return !original; }
   Location getOrigLoc() { return original.getLoc(); }
   ExprKind getKind() const { return kind; }
@@ -189,22 +261,25 @@ public:
   }
   Attribute getCurrAttr() { return current.dyn_cast<Attribute>(); }
   bool isEqual(Expr *other);
+
+  /// Used for clonning expression
+  void copyFrom(Expr *other, Value original);
   void print(raw_ostream &os);
-  void printAsValue(raw_ostream &os) {
-    os << "Expr(" << getID() << ")";
-  }
+  void printAsValue(raw_ostream &os) { os << "Expr(" << getID() << ")"; }
   LLVM_DUMP_METHOD void dump() { return print(llvm::errs()); }
+
   /// Dispatch the lambda to the correct subclass of Expr
-  template <typename RetTy = void, typename T = void>
-  static RetTy dispatchToImpl(Expr *e, T &&callable) {
-    return llvm::TypeSwitch<Expr *, RetTy>(e)
-        .template Case<VariableExpr, ShallowExpr, PHIExpr, GenericOpExpr,
-                       ConstExpr>(callable);
+  template <typename RetTy, typename T>
+  static RetTy dispatchToImpl(Expr *expr, T &&callable) {
+    return llvm::TypeSwitch<Expr *, RetTy>(expr)
+        .template Case<VariableExpr, PHIExpr, GenericOpExpr, ConstExpr,
+                       DeadExpr>(callable);
   }
 };
 
-/// Represent any generic operation, but not constants
-struct GenericOpExpr : Expr {
+/// Represent any generic operation(except constants) that can be merged to an
+/// other expression with the same calculation
+class GenericOpExpr : public Expr {
   /// Operands are ignored because we use Expr to for it
   /// This hash and compare are only intended to compare the action of the
   /// operation not if it processes the same data.
@@ -232,16 +307,25 @@ struct GenericOpExpr : Expr {
   }
 
   unsigned computeHash() {
-    return llvm::hash_combine(kind, hashOpAction(getCurrOp()), getCurrIdx(),
+    return llvm::hash_combine(Expr::generic, hashOpAction(getCurrOp()), getCurrIdx(),
                               getOperands());
   }
 
+public:
   GenericOpExpr(ArrayRef<Expr *> operands, Value orig, Value current)
       : Expr(Expr::generic, orig, current, operands) {
     hash = computeHash();
   }
-public:
-  static bool classof(const Expr *e) { return e->getKind() == Expr::generic; }
+
+  void verifyInvarianceImpl() {
+    assert(hash == computeHash());
+    assert(original);
+    Operation *op = cast<OpResult>(getCurrVal()).getOwner();
+    assert(op->getNumOperands() == getOperands().size());
+  }
+  static bool classof(const Expr *expr) {
+    return expr->getKind() == Expr::generic;
+  }
   bool isEqual(GenericOpExpr *other) {
     if (!isOpActionEqual(getCurrOp(), other->getCurrOp()) ||
         getCurrIdx() != other->getCurrIdx())
@@ -250,80 +334,114 @@ public:
   }
 };
 
-/// An expression that no other value with match with
-struct VariableExpr : Expr {
+/// An expression that cannot be matched by other. It is used for any thing we
+/// cannot reason about. regions arguments, operations that access memory(since
+/// we dont yet model it). since it is not congruent with any other Expr. it
+/// doesn't need to track what the original operations depended upon.
+class VariableExpr : public Expr {
+  unsigned computeHash() {
+    return llvm::hash_combine(Expr::variable, getCurrent());
+  }
+
+public:
   VariableExpr(Value origAndCurrent)
       : Expr(Expr::variable, origAndCurrent, origAndCurrent) {
-    hash = llvm::DenseMapInfo<Value>::getHashValue(getOriginal());
+    hash = computeHash();
   }
-  static bool classof(const Expr *e) { return e->getKind() == Expr::variable; }
-  bool isEqual(VariableExpr *other) { return getOriginal() == other->getOriginal(); }
+  static bool classof(const Expr *expr) {
+    return expr->getKind() == Expr::variable;
+  }
+  bool isEqual(VariableExpr *other) {
+    return getCurrent() == other->getCurrent();
+  }
+  void verifyInvarianceImpl() {
+    assert(hash == computeHash());
+    assert(original);
+    assert(current);
+  }
 };
 
-struct DeadExpr : Expr {
+/// Represent a Value with an undef value. At the start every value is
+/// represented by a DeadExpr.
+class DeadExpr : public Expr {
+  unsigned computeHash() { return llvm::hash_value(Expr::dead); }
+
+public:
   DeadExpr(Value origAndCurrent)
       : Expr(Expr::dead, origAndCurrent, origAndCurrent) {
-    hash = llvm::hash_value(Expr::dead);
+    hash = computeHash();
   }
-  static bool classof(const Expr *e) { return e->getKind() == Expr::dead; }
+  static bool classof(const Expr *expr) {
+    return expr->getKind() == Expr::dead;
+  }
   bool isEqual(DeadExpr *other) { return true; }
-};
-
-struct ShallowExpr : Expr {
-  static Expr *stripShallow(Expr *exprCst) {
-    Expr *expr = const_cast<Expr *>(exprCst);
-    auto *maybeShallow = dyn_cast<ShallowExpr>(expr);
-    if (!maybeShallow)
-      return expr;
-    assert(!isa<ShallowExpr>(maybeShallow->inner));
-    return maybeShallow->inner;
-  }
-  Expr *inner;
-  ShallowExpr(ArrayRef<Expr *> operands, Expr *other, Value original)
-      : Expr(Expr::shallow, original, other->getCurrent(), operands),
-        inner(stripShallow(other)) {
-    setOperands(operands);
-    hash = inner->getHash();
-  }
-  static bool classof(const Expr *e) { return e->getKind() == Expr::shallow; }
-  bool isEqual(Expr *other) {
-    llvm_unreachable("should never be called");
+  void verifyInvarianceImpl() {
+    assert(hash == computeHash());
+    assert(original);
+    assert(current);
   }
 };
 
-struct PHIExpr : Expr {
+/// Represent a merge in control-flow. contrary to other ops the value
+/// represented by a PHIExpr is a BlockArgument, no an OpResult.
+class PHIExpr : public Expr {
+  unsigned computeHash() {
+    /// PHIs from different blocks may not have the same condition to split the
+    /// value. So they cant be considered equal.
+    return llvm::hash_combine(kind, getCurrVal().getParentBlock(), getOperands());
+  }
+
+public:
   PHIExpr(ArrayRef<Expr *> operands, Value original)
-      : Expr(Expr::phi, original, nullptr, operands) {
-    assert(operands.size() > 1 && "should be a shallow");
-    setOperands(operands);
-    hash = llvm::hash_combine(kind, original.getParentBlock(), getOperands());
+      : Expr(Expr::phi, original, original, operands) {
+    assert(operands.size() > 1 && "phi(x) should be x");
+    initOperands(operands);
+    hash = computeHash();
+    if (hash == 1424709350)
+      dump();
   }
-  static bool classof(const Expr *e) { return e->getKind() == Expr::phi; }
+  static bool classof(const Expr *expr) { return expr->getKind() == Expr::phi; }
   bool isEqual(PHIExpr *other) {
     return isOperandEqual(other) &&
            original.getParentBlock() == other->original.getParentBlock();
   }
+  void verifyInvarianceImpl() {
+    assert(hash == computeHash());
+    assert(isa<BlockArgument>(original));
+    assert(current);
+  }
 };
 
-struct ConstExpr : Expr {
-  Dialect* dialect;
+/// Represent a constant. The constants are represented with attributes instead
+/// of Values
+class ConstExpr : public Expr {
+  unsigned computeHash() { return llvm::hash_combine(kind, getCurrAttr()); }
+
+public:
+  /// Keep track of the dialect such that the constant can get materialized
+  Dialect *dialect;
+
   ConstExpr(Value orig, Attribute cst, Dialect *dialect)
       : Expr(Expr::constant, orig, cst), dialect(dialect) {
-    hash = llvm::hash_combine(kind, getCurrAttr());
+    hash = computeHash();
   }
-  static bool classof(const Expr *e) { return e->getKind() == Expr::constant; }
+  static bool classof(const Expr *expr) {
+    return expr->getKind() == Expr::constant;
+  }
   bool isEqual(ConstExpr *other) {
     /// Attribute are uniqued so if they are the same they have the same pointer
     return getCurrAttr() == other->getCurrAttr();
   }
+  void copyFromImpl(ConstExpr *other) { dialect = other->dialect; }
+  void verifyInvarianceImpl() {
+    assert(hash == computeHash());
+    assert(original);
+    assert(getCurrAttr());
+  }
 };
 
-IRObjectWithUseList<ExprOperand, Expr *> *ExprOperand::getUseList(Expr *value) {
-  return value;
-}
-
 /// This is used to hash and compare expression that should be merged into the
-/// same congruence class
+/// same congruence class.
 struct DenseMapExprUniquer : DenseMapInfo<Expr *> {
   static unsigned getHashValue(const Expr *val) {
     return const_cast<Expr *>(val)->getHash();
@@ -347,13 +465,19 @@ struct DenseMapExprUniquer : DenseMapInfo<Expr *> {
 };
 
 bool Expr::isEqual(Expr *other) {
+  /// Hash maps like DenseMap only use part of the hash for bucketing and not
+  /// the full hash that is already calculated.
   if (getHash() != other->getHash())
     return false;
-  Expr *lhs = ShallowExpr::stripShallow(this);
-  Expr *rhs = ShallowExpr::stripShallow(other);
+
+  Expr *lhs = this;
+  Expr *rhs = other;
 
   if (lhs->kind != rhs->kind)
     return false;
+
+  /// All expressions use different rules for how they can match each other. so
+  /// delegate their implementation
   bool result = dispatchToImpl<bool>(
       lhs, [&](auto first) { return first->isEqual((decltype(first))rhs); });
   assert(!result ||
@@ -361,17 +485,41 @@ bool Expr::isEqual(Expr *other) {
   return result;
 }
 
+void Expr::copyFrom(Expr *other, Value orig) {
+  numOperands = other->numOperands;
+  kind = other->kind;
+  hash = other->hash;
+  current = other->current;
+  original = orig;
+
+  /// classes should be assigned by updateCongruenceFor and not here
+
+  for (unsigned idx = 0; idx < other->getOperands().size(); idx++)
+    initOperand(getOperands()[idx], other->getOperands()[idx].get());
+  dispatchToImpl<int>(this, [&](auto *expr) {
+    expr->copyFromImpl((decltype(expr))other);
+    return 0;
+  });
+}
+
+/// Represent a set of Expr that are considered to be congruent.
+/// all live CongruenceClass are kept in an intrusive list. that is pruned as
+/// expressions are moved from one class to an other
 struct CongruenceClass : public llvm::ilist_node<CongruenceClass>,
                          public WithID {
   using ilist = llvm::ilist_node<CongruenceClass>;
-  CongruenceClass(Value l) : leader(l) {}
-
-  /// TODO: make sure it is always dominating every other member
-  Value leader;
+  ~CongruenceClass() { assert(members.empty()); }
 
   /// Should only be modified by addToClass
-  /// Because the GVNState keeps track of which classes are live
+  /// Because the GVNState keeps track of which classes are live.
+  /// And of whether or not the leader changed, when the leader changes all
+  /// expressions in the class need to be reprocessed
   llvm::iplist<Expr> members;
+
+  Expr *getLeader() {
+    assert(!members.empty());
+    return &members.front();
+  }
 
   LLVM_DUMP_METHOD void dump() { print(llvm::errs()); }
   void print(raw_ostream &os);
@@ -382,6 +530,15 @@ struct CongruenceClass : public llvm::ilist_node<CongruenceClass>,
     else
       os << "null";
     os << ")";
+  }
+  void verifyInvariance() {
+#ifndef NDEBUG
+    assert(isInList() != members.empty());
+    for (Expr &elem : members) {
+      elem.verifyInvariance();
+      assert(elem.cClass == this);
+    }
+#endif
   }
 };
 
@@ -398,37 +555,46 @@ raw_ostream &operator<<(raw_ostream &os, CongruenceClass &expr) {
 void CongruenceClass::print(raw_ostream &os) {
   os << "CongruenceClass ";
   os << "id=" << getID();
-  os << " leader=" << leader << " members("
-     << std::distance(members.begin(), members.end()) << ")=\n";
+  os << " leader=";
+  if (!members.empty())
+    getLeader()->printAsValue(os);
+  else
+    os << "null";
+  os << " members(" << std::distance(members.begin(), members.end()) << ")=\n";
   for (Expr &mem : members)
     os << mem << "\n";
 }
 
 void Expr::print(raw_ostream &os) {
-  os << "Expr{";
+  os << "Expr ";
   os << getID();
-  os << " " << llvm::utohexstr(hash);
   os << " " << exprKindToStr(kind) << " ";
   CongruenceClass::printAsValue(os, cClass);
 
-  /// For VariableExpr current == orig so no need to print both.
-  /// For for shallow current == inner->current
-  if (!isa<ShallowExpr, VariableExpr>(this)) {
-    if (auto val = getCurrVal())
-      os << " curr=" << val.getImpl() << ":\"" << val << "\"";
-    if (auto attr = getCurrAttr())
-      os << " curr=" << attr.getImpl() << ":\"" << attr << "\"";
+  auto printVal = [&](Value val) {
+    if (!val) {
+      os << "null";
+      return;
+    }
+    os << llvm::utohexstr(((uintptr_t)val.getImpl()) & 0xffffff) << ":";
+    if (BlockArgument arg = dyn_cast<BlockArgument>(val))
+      os << "arg " << val.getType() << " at " << arg.getArgNumber();
+    else
+      os << val;
+  };
+
+  if (auto val = getCurrVal()) {
+    os << " curr=";
+    printVal(val);
   }
-  os << " orig=" << getOriginal().getImpl() << ":\"" << getOriginal() << "\" ";
-  if (auto *se = dyn_cast<ShallowExpr>(this)) {
-    os << " inner=";
-    se->inner->printAsValue(os);
-  }
+  if (auto attr = getCurrAttr())
+    os << " curr=" << attr.getImpl() << ":\"" << attr << "\"";
+  os << " orig=";
+  printVal(getOriginal());
   for (ExprOperand &operand : getOperands()) {
     os << " ";
     operand.get()->printAsValue(os);
   }
-  os << "}";
 }
 
 } // namespace
@@ -454,6 +620,8 @@ namespace gvn {
 struct GVNstate;
 
 /// Global information about the current GVN pass.
+/// It is mostly in charge of traversing the IR structure and run GVN on
+/// regions.
 struct GVNPass : public impl::GVNBase<GVNPass> {
   DominanceInfo *domInfo = nullptr;
 
@@ -464,13 +632,14 @@ struct GVNPass : public impl::GVNBase<GVNPass> {
   void runOnOperation() override;
 };
 
+/// The factory for expressions and CongruenceClasses
 class Allocator {
   unsigned exprID = 1;
   unsigned classID = 1;
   llvm::BumpPtrAllocator allocator;
   llvm::ArrayRecycler<Expr> recycler;
   using alloc_capacity = llvm::ArrayRecycler<Expr>::Capacity;
-  public:
+
   void *allocate(size_t size) {
     return (void *)recycler.allocate(alloc_capacity::get(size), allocator);
   }
@@ -481,26 +650,64 @@ class Allocator {
             std::is_same_v<DeadExpr, T> || std::is_same_v<ConstExpr, T>,
         "T must be simple");
   }
+  template <typename T>
+  void *allocComplex(unsigned count) {
+    static_assert(alignof(T) == alignof(ExprOperand));
+    unsigned operandSize = sizeof(ExprOperand) * count;
+    char *startAddr = (char *)allocate(sizeof(T) + operandSize);
+    return startAddr + operandSize;
+  }
+
+#ifndef NDEBUG
+  Expr *assignID(Expr *expr) {
+    assert(expr->getID() == 0);
+    expr->setID(exprID++);
+    exprs.push_back(expr);
+    return expr;
+  }
+  CongruenceClass *assignID(CongruenceClass *cClass) {
+    assert(cClass->getID() == 0);
+    cClass->setID(classID++);
+    classes.push_back(cClass);
+    return cClass;
+  }
+  void remove(Expr *expr) {
+    for (Expr *&elem : exprs)
+      if (elem == expr)
+        elem = nullptr;
+  }
+  void remove(CongruenceClass *cClass) {
+    for (CongruenceClass *&elem : classes)
+      if (elem == cClass)
+        elem = nullptr;
+  }
+  SmallVector<Expr *> exprs;
+  SmallVector<CongruenceClass *> classes;
+#endif
+public:
   template <typename T, typename... Ts>
   T *makeSimple(Ts &&...ts) {
     assertSimple<T>();
     auto *res = ::new (allocate(sizeof(T))) T(std::forward<Ts>(ts)...);
+#ifndef NDEBUG
     assignID(res);
+#endif
     return res;
   }
   template <typename T>
   void deleteImpl(size_t allocSize, T *ptr) {
+#ifndef NDEBUG
+    remove(ptr);
+#endif
     ptr->~T();
     recycler.deallocate(alloc_capacity::get(allocSize), (Expr *)ptr);
   }
   template <typename T, typename... Ts>
   T *makeComplex(ArrayRef<Expr *> operands, Ts &&...ts) {
-    static_assert(alignof(T) == alignof(ExprOperand));
-    unsigned operandSize = sizeof(ExprOperand) * operands.size();
-    char *startAddr = (char *)allocate(sizeof(T) + operandSize);
-    void *objAddr = startAddr + operandSize;
-    T *res = new (objAddr) T(operands, ts...);
+    T *res = new (allocComplex<T>(operands.size())) T(operands, ts...);
+#ifndef NDEBUG
     assignID(res);
+#endif
     return res;
   }
   void deleteObj(CongruenceClass *ptr) {
@@ -515,16 +722,32 @@ class Allocator {
                    ptr->getOperands().size() * sizeof(ExprOperand),
                ptr);
   }
-  Expr *assignID(Expr *expr) {
-    assert(expr->getID() == 0);
-    expr->setID(exprID++);
-    return expr;
+  Expr *cloneExpr(Expr *from, Value original) {
+    void *addr = Expr::dispatchToImpl<void *>(from, [&](auto *expr) {
+      return allocComplex<std::remove_pointer_t<decltype(expr)>>(
+          from->getOperands().size());
+    });
+    Expr *res = new (addr) Expr(Expr::EmptyTag{});
+#ifndef NDEBUG
+    assignID(res);
+#endif
+    res->copyFrom(from, original);
+    return res;
   }
-  CongruenceClass *assignID(CongruenceClass *cClass) {
-    assert(cClass->getID() == 0);
-    cClass->setID(classID++);
-    return cClass;
+  LLVM_DUMP_METHOD void dump();
+
+  /// This is pretty expensive
+  void verifyInvariance() {
+#ifndef NDEBUG
+    for (CongruenceClass *c : classes)
+      if (c)
+        c->verifyInvariance();
+    for (Expr *e : exprs)
+      if (e)
+        e->verifyInvariance();
+#endif
   }
+  ~Allocator() { recycler.clear(allocator); }
 };
 
 /// Numbering of a block
@@ -578,9 +801,12 @@ public:
     };
     void finalize() { impl.touchedValues.resize(valCounter); }
   };
-  unsigned lookupNum(ValOrOp val) {
+  unsigned lookupNumOr0(ValOrOp val) {
     assert(!val.isNull());
-    unsigned res = valOrOpToNum.lookup(val);
+    return valOrOpToNum.lookup(val);
+  }
+  unsigned lookupNum(ValOrOp val) {
+    unsigned res = lookupNumOr0(val);
     assert(res);
     return res;
   }
@@ -632,26 +858,6 @@ public:
   }
 };
 
-struct ExprVal {
-  Expr* expr;
-  Value val;
-};
-
-struct ExprValMapInfo {
-  static ExprVal getEmptyKey() {
-    return {DenseMapInfo<Expr *>::getEmptyKey(), nullptr};
-  }
-  static ExprVal getTombstoneKey() {
-    return {DenseMapInfo<Expr *>::getTombstoneKey(), nullptr};
-  }
-  static unsigned getHashValue(ExprVal val) {
-    return DenseMapExprUniquer::getHashValue(val.expr);
-  }
-  static bool isEqual(ExprVal lhs, ExprVal rhs) {
-    return DenseMapExprUniquer::isEqual(lhs.expr, rhs.expr);
-  }
-};
-
 /// Local information about the GVN pass. there is one of these per operation
 /// isolatedFromAbove
 struct GVNstate {
@@ -661,24 +867,34 @@ struct GVNstate {
   Allocator alloc;
   UpdateAndNumberingTracker tracker;
 
-  DenseMap<Value, Expr *> valueToExpr;
-  /// Expr* is not hash and compared based on its pointer but based on the
-  /// content of the Expr
-  DenseMap<Expr *, CongruenceClass *, DenseMapExprUniquer> exprMerger;
-  Value lookupLeader(Value val) {
-    Expr *expr = valueToExpr.lookup(val);
-    if (expr->cClass) {
-      if (expr->cClass == initialClass)
-        /// TODO: This should return poison
-        return val;
-      return expr->cClass->leader;
-    }
-    return val;
-  }
-
   /// NewGVN calls it Top
   CongruenceClass *initialClass;
   llvm::iplist<CongruenceClass> liveClasses;
+  DenseMap<Value, Expr *> valueToExpr;
+  void removeFromClass(Expr *expr) {
+    /// remove expr from the class
+    expr->cClass->members.remove(expr);
+    /// Cleanup the class if it is now empty
+    if (expr->cClass->members.empty()) {
+      liveClasses.remove(expr->cClass);
+      alloc.deleteObj(expr->cClass);
+    }
+  }
+  Expr *lookupExpr(Value val) {
+    Expr *expr = valueToExpr.lookup(val);
+    assert(expr);
+    return expr;
+  }
+  void updateExpr(Expr *expr, Value val) {
+    assert(expr->getOriginal() == val);
+    Expr *&current = valueToExpr[val];
+    assert(current->getOriginal() == val);
+    removeFromClass(current);
+
+    /// expressions can still be used by other expression that dont need an
+    /// update. so we do not delete them
+    current = expr;
+  }
   /// Add or transfer v to newClass
   /// Also keeps liveClasses up to date
   void addToClass(Expr *expr, CongruenceClass *newClass) {
@@ -687,42 +903,48 @@ struct GVNstate {
       liveClasses.push_back(newClass);
 
     /// If expr already has a class
-    if (expr->cClass) {
-      /// remove expr from the class
-      expr->cClass->members.remove(expr);
-      /// Cleanup the class if it is now empty
-      if (expr->cClass->members.empty()) {
-        liveClasses.remove(expr->cClass);
-        alloc.deleteObj(expr->cClass);
-      }
-    }
+    if (expr->cClass)
+      removeFromClass(expr);
     /// add expr to the new class
     newClass->members.push_back(expr);
     expr->cClass = newClass;
-    assert(exprMerger.count(expr));
     exprMerger[expr] = expr->cClass;
+  }
+
+  /// Expr* is not hash and compared based on its pointer but based on the
+  /// content of the Expr
+  DenseMap<Expr *, CongruenceClass *, DenseMapExprUniquer> exprMerger;
+  Expr *lookupLeader(Value val) {
+    Expr *expr = lookupExpr(val);
+    if (expr->cClass) {
+      if (expr->cClass == initialClass)
+        /// TODO: This should return undef
+        return expr;
+      return expr->cClass->getLeader();
+    }
+    return expr;
   }
 
   /// Reachability tacking
   llvm::SmallDenseSet<Block *, 1> reachableBlocks;
   DenseSet<BlockEdge> reachableEdges;
-  SmallVector<Operation*> temporaries;
+  SmallVector<Operation *> temporaries;
 
   Region *region = nullptr;
   DominanceInfo *getDom();
 
   /// Initialization
-  LogicalResult isValidOp(Region &r, Operation*);
+  LogicalResult isValidOp(Region &r, Operation *);
   LogicalResult setupFor(Region &r);
   void initCongruenceClasses();
 
   /// Iteration
-  void updateCongruenceFor(ExprVal ev);
-  void processGenericOp(Operation *op, SmallVectorImpl<Expr*> &res);
+  void updateCongruenceFor(Expr *expr, Value val);
+  void processGenericOp(Operation *op, SmallVectorImpl<Expr *> &res);
   void updateReachableEdge(BlockEdge edge);
-  void processTerminator(Operation *op, SmallVectorImpl<Expr*> &res);
-  void processBlockArg(BlockArgument arg, SmallVectorImpl<Expr*> &res);
-  void processValOrOp(ValOrOp iterable, SmallVectorImpl<Expr*> &res);
+  void processTerminator(Operation *op, SmallVectorImpl<Expr *> &res);
+  void processBlockArg(BlockArgument arg, SmallVectorImpl<Expr *> &res);
+  void processValOrOp(ValOrOp iterable, SmallVectorImpl<Expr *> &res);
   void iterate();
 
   /// Change the IR
@@ -745,12 +967,27 @@ public:
   }
 };
 
+LLVM_DUMP_METHOD void Allocator::dump() {
+  llvm::errs() << "classes (" << classes.size() << "):\n";
+  for (CongruenceClass *cClass : classes)
+    if (cClass) {
+      cClass->dump();
+      llvm::errs() << "\n";
+    }
+  llvm::errs() << "exprs (" << exprs.size() << "):\n";
+  for (Expr *elem : exprs)
+    if (elem) {
+      elem->dump();
+      llvm::errs() << "\n";
+    }
+}
+
 void GVNstate::initCongruenceClasses() {
   /// Create the default class. This GVN is optimistic so everything left inside
-  /// it at the end is dead or poison
+  /// it at the end is dead or undef
   MLIRContext *ctx = region->getContext();
   IRRewriter rewriter(ctx);
-  initialClass = alloc.makeSimple<CongruenceClass>(nullptr);
+  initialClass = alloc.makeSimple<CongruenceClass>();
 
   /// Go through every reachable blocks
   for (Block &b : region->getBlocks()) {
@@ -763,8 +1000,11 @@ void GVNstate::initCongruenceClasses() {
       addToClass(expr, initialClass);
     };
 
-    for (BlockArgument &arg : b.getArguments())
-      add(arg);
+    /// the entry block doesn't have block arguments because there is no edges
+    /// coming into it.
+    if (&b != &region->front())
+      for (BlockArgument &arg : b.getArguments())
+        add(arg);
     for (Operation &o : b.getOperations())
       for (Value res : o.getResults())
         add(res);
@@ -772,47 +1012,60 @@ void GVNstate::initCongruenceClasses() {
 
   /// Arguments of the region are all unique so they have their own class
   for (BlockArgument &arg : region->front().getArguments()) {
-    Expr *e = alloc.makeSimple<VariableExpr>(arg);
-    valueToExpr[arg] = e;
-    addToClass(e, alloc.makeSimple<CongruenceClass>(arg));
-    LLVM_DEBUG(llvm::dbgs() << "arg expr:" << *e << "\n");
+    Expr *expr = alloc.makeSimple<VariableExpr>(arg);
+    valueToExpr[arg] = expr;
+    addToClass(expr, alloc.makeSimple<CongruenceClass>());
+    LLVM_DEBUG(llvm::dbgs() << "arg expr:" << *expr << "\n");
   }
 }
 
-void GVNstate::updateCongruenceFor(ExprVal ev) {
-  Expr* expr = ev.expr;
-  Value val = ev.val;
+void GVNstate::updateCongruenceFor(Expr *expr, Value val) {
   CongruenceClass *currentClass = expr->cClass;
   auto lookupResult = exprMerger.insert({expr, nullptr});
 
   /// There is no match so we create a new congruence class
   if (lookupResult.second)
     /// Update the map
-    lookupResult.first->second = alloc.makeSimple<CongruenceClass>(val);
+    lookupResult.first->second = alloc.makeSimple<CongruenceClass>();
   CongruenceClass *newClass = lookupResult.first->second;
-  if (currentClass != newClass) {
-    addToClass(expr, newClass);
 
-    /// The class has changed so update every user
-    for (OpOperand operand : val.getUsers())
-      if (operand.getOwner()->getParentRegion() == region)
-        tracker.set(operand.getOwner());
-  }
-  LLVM_DEBUG(llvm::dbgs() << "updated class:" << *newClass);
-  valueToExpr[val] = expr;
+  /// If the class has not changed there is nothing left to do.
+  if (currentClass == newClass)
+    return;
+
+  /// If expr is the current leader of the old class.
+  /// For update the old class members
+  if (currentClass && currentClass->getLeader() == expr)
+    for (Expr &elem : currentClass->members)
+      tracker.set(elem.getOriginal());
+
+  /// Move expr to the new class
+  addToClass(expr, newClass);
+
+  /// expr is in a new class, update its users
+  for (OpOperand operand : val.getUsers())
+    if (operand.getOwner()->getParentRegion() == region)
+      /// Unreachable code is not in tracked but can still use our values
+      /// So we skip if the lookup returns 0, 0 means not tracked so unreachable
+      if (unsigned num = tracker.lookupNumOr0(operand.getOwner()))
+        tracker.set(num);
+  updateExpr(expr, val);
+
+  LLVM_DEBUG(llvm::dbgs() << "expr moved to:" << *newClass);
 }
 
 void GVNstate::processBlockArg(BlockArgument arg,
-                               SmallVectorImpl<Expr*> &res) {
+                               SmallVectorImpl<Expr *> &res) {
   /// Block arguments are processed like we would process a phi node.
 
-  /// operands are uniqued by there Expr*
+  /// operands are uniqued by there Expr*, operands are kept in order. because
+  /// phi(a, b) != phi(b, a)
   SetVector<Expr *, SmallVector<Expr *, 4>,
             llvm::SmallDenseSet<Expr *, 4, DenseMapExprUniquer>>
       exprs;
   Block *curr = arg.getParentBlock();
   for (auto it = curr->pred_begin(); it != curr->pred_end(); it++) {
-    Block* pred = *it;
+    Block *pred = *it;
 
     /// If the edge is unreachable, skip it.
     if (!reachableEdges.contains({pred, curr}))
@@ -821,9 +1074,9 @@ void GVNstate::processBlockArg(BlockArgument arg,
     Value operand =
         br->getOperand(br.getSuccessorOperands(it.getSuccessorIndex())
                            .getOperandIndex(arg.getArgNumber()));
-    Expr *expr = valueToExpr.lookup(operand);
+    Expr *expr = lookupExpr(operand);
 
-    /// initial is poison so: phi(poison, x) -> x
+    /// initial is undef so: phi(undef, ...) -> phi(...)
     if (expr->cClass == initialClass)
       continue;
 
@@ -832,10 +1085,9 @@ void GVNstate::processBlockArg(BlockArgument arg,
 
   /// TODO: add more phi folding technics
 
-  /// phi of a single Expr is that expression
+  /// phi(a) == a
   if (exprs.size() == 1) {
-    res.push_back(alloc.makeComplex<ShallowExpr>(
-        ArrayRef<Expr *>{exprs.front()}, exprs.front(), arg));
+    res.push_back(alloc.cloneExpr(exprs.front(), arg));
     return;
   }
 
@@ -855,7 +1107,7 @@ void GVNstate::updateReachableEdge(BlockEdge edge) {
   }
 }
 
-void GVNstate::processTerminator(Operation *op, SmallVectorImpl<Expr*> &res) {
+void GVNstate::processTerminator(Operation *op, SmallVectorImpl<Expr *> &res) {
   assert(op->hasTrait<OpTrait::IsTerminator>());
 
   /// Update reachability, and touched instructions
@@ -866,7 +1118,7 @@ void GVNstate::processTerminator(Operation *op, SmallVectorImpl<Expr*> &res) {
   processGenericOp(op, res);
 }
 
-void GVNstate::processGenericOp(Operation *op, SmallVectorImpl<Expr*> &res) {
+void GVNstate::processGenericOp(Operation *op, SmallVectorImpl<Expr *> &res) {
   /// fallback for now
   if (!MemoryEffectOpInterface::hasNoEffect(op)) {
     for (Value val : op->getResults())
@@ -883,67 +1135,62 @@ void GVNstate::processGenericOp(Operation *op, SmallVectorImpl<Expr*> &res) {
       return lhsID < rhsID;
     });
 
-  /// Dont try to fold if it has a region
-  if (!op->getNumRegions()) {
-    SmallVector<Value, 4> inputLeaders;
-    SmallVector<Attribute, 4> constInput;
+  SmallVector<Attribute, 4> constInput;
+  SmallVector<Expr *, 4> exprs;
 
-    /// We assume that the input is already canonical, so if we have no more
-    /// information than the op previously had we will not try to fold
-    bool shouldTryTyFold = false;
-    for (Value in : inputs) {
-      Value leader = lookupLeader(in);
-      shouldTryTyFold |= (in != leader);
-      Attribute constant;
-      if (matchPattern(leader, m_Constant(&constant)))
-        shouldTryTyFold |= 1;
-      inputLeaders.push_back(leader);
-      constInput.push_back(constant);
-    }
-    if (shouldTryTyFold || op->hasTrait<OpTrait::ConstantLike>()) {
-      Operation *newOp = op->clone();
-      /// Update operands with known information from the GVN
-      newOp->setOperands(inputLeaders);
-
-      SmallVector<OpFoldResult> foldResult;
-      if (succeeded(newOp->fold(constInput, foldResult))) {
-        if (foldResult.empty()) {
-          /// Folded to an updated operation
-          LLVM_DEBUG(llvm::dbgs() << "folded: \"" << *op << "\" to: \"" << newOp << "\"\n");
-          temporaries.push_back(newOp);
-          return processGenericOp(newOp, res);
-        }
-        /// Folded to a constant or variable
-        LLVM_DEBUG(llvm::dbgs() << "folded: \"" << *op << "\" to:";
-                   for (OpFoldResult val
-                        : foldResult) llvm::dbgs()
-                   << " \"" << val << "\"";
-                   llvm::dbgs() << "\n");
-        newOp->erase();
-        for (unsigned idx = 0; idx < foldResult.size(); idx++) {
-          if (Value val = foldResult[idx].dyn_cast<Value>())
-            res.push_back(
-                alloc.makeComplex<ShallowExpr>({}, valueToExpr[val], inputs[idx]));
-          else
-            res.push_back(alloc.makeSimple<ConstExpr>(
-                op->getResults()[idx], foldResult[idx].dyn_cast<Attribute>(),
-                op->getDialect()));
-        }
-        return;
-      }
-      newOp->erase();
-    }
+  for (Value &in : inputs) {
+    Expr *leader = lookupLeader(in);
+    exprs.push_back(leader);
+    Attribute constant = leader->getCurrAttr();
+    in = leader->getCurrVal() ? leader->getCurrVal() : in;
+    constInput.push_back(constant);
   }
 
-  SmallVector<Expr *, 4> exprs;
-  llvm::transform(inputs, std::back_inserter(exprs),
-                  [&](Value val) { return valueToExpr[val]; });
+  /// Dont try to fold if it has a region
+  if (!op->getNumRegions()) {
+
+    Operation *newOp = op->clone();
+    /// Update operands with known information from the GVN
+    newOp->setOperands(inputs);
+
+    SmallVector<OpFoldResult> foldResult;
+    if (succeeded(newOp->fold(constInput, foldResult))) {
+      if (foldResult.empty()) {
+        /// Folded to an updated operation
+        assert(false && "this path is still un tested");
+        LLVM_DEBUG(llvm::dbgs()
+                   << "folded: \"" << *op << "\" to: \"" << newOp << "\"\n");
+        temporaries.push_back(newOp);
+        return processGenericOp(newOp, res);
+      }
+      /// Folded to a constant or variable, so we dont need to keep the
+      /// operation around
+      LLVM_DEBUG(llvm::dbgs() << "folded: \"" << *op << "\" to:";
+                 for (OpFoldResult val
+                      : foldResult) llvm::dbgs()
+                 << " \"" << val << "\"";
+                 llvm::dbgs() << "\n");
+
+      newOp->erase();
+      for (unsigned idx = 0; idx < foldResult.size(); idx++) {
+        if (Value val = foldResult[idx].dyn_cast<Value>())
+          res.push_back(
+              alloc.cloneExpr(lookupExpr(val), op->getResults()[idx]));
+        else
+          res.push_back(alloc.makeSimple<ConstExpr>(
+              op->getResult(idx), foldResult[idx].dyn_cast<Attribute>(),
+              op->getDialect()));
+      }
+      return;
+    }
+    newOp->erase();
+  }
 
   for (OpResult v : op->getResults())
     res.push_back(alloc.makeComplex<GenericOpExpr>(exprs, v, v));
 }
 
-void GVNstate::processValOrOp(ValOrOp iterable, SmallVectorImpl<Expr*> &res) {
+void GVNstate::processValOrOp(ValOrOp iterable, SmallVectorImpl<Expr *> &res) {
   /// Dispatch the ValOrOp
   if (auto arg = dyn_cast_if_present<BlockArgument>(iterable.dyn_cast<Value>()))
     return processBlockArg(arg, res);
@@ -987,13 +1234,14 @@ void GVNstate::iterate() {
       processValOrOp(iterable, results);
       if (auto val = iterable.dyn_cast<Value>()) {
         assert(results.size() == 1);
-        updateCongruenceFor({results[0], val});
+        updateCongruenceFor(results[0], val);
       } else {
         Operation *op = iterable.get<Operation *>();
         assert(op->getNumResults() == results.size());
         for (unsigned idx = 0; idx < op->getNumResults(); idx++)
-          updateCongruenceFor({results[idx], op->getResult(idx)});
+          updateCongruenceFor(results[idx], op->getResult(idx));
       }
+      alloc.verifyInvariance();
     }
   }
 }
@@ -1007,31 +1255,45 @@ void GVNstate::performChanges() {
   llvm::SmallPtrSet<BlockArgument, 16> cleanupBlockArg;
 
   for (CongruenceClass &cClass : liveClasses) {
-    /// TODO: replace initial by poison
-    if (!cClass.leader)
+    /// TODO: replace initial by undef
+    if (&cClass == initialClass)
       continue;
 
-    for (Expr &e : cClass.members) {
-      Value val = e.getCurrent().dyn_cast<Value>();
-      if (ConstExpr *cst = dyn_cast<ConstExpr>(&e)) {
-        val = folder.getOrCreateConstant(
+    Value replacement = cClass.getLeader()->getCurrVal();
+    if (ConstExpr *cst = dyn_cast<ConstExpr>(cClass.getLeader())) {
+      auto *origOp = cst->getOriginal().getDefiningOp();
+      if (origOp && origOp->hasTrait<OpTrait::ConstantLike>()) {
+        origOp->moveBefore(&region->front().front());
+        replacement = cst->getOriginal();
+      } else {
+        replacement = folder.getOrCreateConstant(
             rewriter, cst->dialect, cst->getCurrAttr(),
             cst->getOriginal().getType(), cst->getOrigLoc());
-        assert(val && "failed to materialize constant");
+        assert(replacement && "failed to materialize constant");
       }
-      /// TODO: make constant
-      if (val == cClass.leader)
+    }
+
+    for (Expr &elem : cClass.members) {
+      /// dont replace the leader
+      if (&elem == cClass.getLeader())
         continue;
-      LLVM_DEBUG(llvm::dbgs() << "replacing: " << val << " by "
-                              << cClass.leader << "\n");
-      val.replaceAllUsesWith(cClass.leader);
+
+      /// If the replacement doesn't dominate every use, skip it.
+      /// TODO: sinking to users
+      if (!llvm::all_of(elem.getOriginal().getUsers(), [&](Operation *user) {
+            return getDom()->dominates(replacement, user);
+          }))
+        continue;
+      LLVM_DEBUG(llvm::dbgs() << "replacing: " << elem.getOriginal() << " by "
+                              << replacement << "\n");
+      elem.getOriginal().replaceAllUsesWith(replacement);
 
       /// If we removed all use of a block argument, erase it.
-      if (auto arg = dyn_cast<BlockArgument>(val))
+      if (auto arg = dyn_cast<BlockArgument>(elem.getOriginal()))
         if (!arg.getParentBlock()->isEntryBlock())
           cleanupBlockArg.insert(arg);
 
-      if (auto *op = val.getDefiningOp())
+      if (auto *op = elem.getOriginal().getDefiningOp())
         tryCleanupOp.insert(op);
     }
   }
@@ -1046,7 +1308,7 @@ void GVNstate::performChanges() {
     assert(arg.use_empty());
     LLVM_DEBUG(llvm::dbgs() << "erasing: " << arg << "\n");
     int idx = arg.getArgNumber();
-    Block* curr = arg.getOwner();
+    Block *curr = arg.getOwner();
     for (auto it = curr->pred_begin(); it != curr->pred_end(); it++) {
       Block *pred = *it;
 
@@ -1094,6 +1356,7 @@ LogicalResult GVNstate::isValidOp(Region &r, Operation *o) {
 
 LogicalResult GVNstate::setupFor(Region &r) {
   UpdateAndNumberingTracker::Builder builder(tracker);
+  /// Block arguments are used to present PHI nodes.
 
   /// For some reason Dominator tree doest work for block with only one block
   /// Se here is our fallback
@@ -1102,6 +1365,7 @@ LogicalResult GVNstate::setupFor(Region &r) {
     /// to make sure every value has a different ID when ordering in commutative
     /// ops
     builder.startBlock();
+    /// This is not needed or control-flow but just for value ranking
     for (BlockArgument &arg : r.front().getArguments())
       builder.assignNumbering(arg);
     builder.endArgs();
@@ -1132,8 +1396,9 @@ LogicalResult GVNstate::setupFor(Region &r) {
     for (auto *domNode :
          depth_first_ext(getDom()->getRootNode(&r), reachable)) {
       Block *b = domNode->getBlock();
-      builder.startBlock();
+
       /// Generate a numbering for a Value or an Op that we may need to process
+      builder.startBlock();
       for (BlockArgument &arg : b->getArguments())
         builder.assignNumbering(arg);
       builder.endArgs();
@@ -1142,6 +1407,7 @@ LogicalResult GVNstate::setupFor(Region &r) {
           return failure();
         builder.assignNumbering(&o);
       }
+
       builder.endBlock(b);
     }
   }
