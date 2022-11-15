@@ -77,6 +77,16 @@ def CSE : Pass<"cse"> {
   ];
 }
 
+def GVN : Pass<"gvn"> {
+  let summary = "Global Value Numbering";
+  let description = [{
+    still experimental
+  }];
+  let constructor = "mlir::createGVNPass()";
+  let statistics = [
+  ];
+}
+
 def Inliner : Pass<"inline"> {
   let summary = "Inline function calls";
   let constructor = "mlir::createInlinerPass()";
