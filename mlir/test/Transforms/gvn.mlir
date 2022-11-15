@@ -1,41 +1,12 @@
 // RUN: mlir-opt -allow-unregistered-dialect %s -pass-pipeline='builtin.module(func.func(gvn))' | FileCheck %s
 
-// CHECK-LABEL:   func.func @up_propagate_region() -> i32 {
-// CHECK:           %[[VAL_0:.*]] = arith.constant 1 : i32
-// CHECK:           %[[VAL_1:.*]] = arith.constant true
-// CHECK:           %[[VAL_2:.*]] = arith.constant 0 : i32
-// CHECK:           cf.cond_br %[[VAL_1]], ^bb1, ^bb2(%[[VAL_2]] : i32)
-// CHECK:         ^bb1:
-// CHECK:           cf.br ^bb2(%[[VAL_0]] : i32)
-// CHECK:         ^bb2(%[[VAL_3:.*]]: i32):
-// CHECK:           %[[VAL_4:.*]] = arith.addi %[[VAL_3]], %[[VAL_0]] : i32
-// CHECK:           return %[[VAL_4]] : i32
-// CHECK:         }
-func.func @up_propagate_region() -> i32 {
-  %1 = arith.constant 0 : i32
-  %true = arith.constant true
-  cf.cond_br %true, ^bb1, ^bb2(%1 : i32)
-
-  ^bb1:
-
-  %c1_i32 = arith.constant 1 : i32
-  cf.br ^bb2(%c1_i32 : i32)
-
-  ^bb2(%arg : i32):
-
-  %c1_i32_0 = arith.constant 1 : i32
-  %2 = arith.addi %arg, %c1_i32_0 : i32
-  return %2 : i32
-}
-// CHECK-LABEL:   func.func @basic() -> (i32, i32) {
+// CHECK-LABEL:   func.func @basic_constant_fold() -> (i32, i32) {
 // CHECK:           %[[VAL_0:.*]] = arith.constant 4 : i32
 // CHECK:           %[[VAL_1:.*]] = arith.constant 2 : i32
 // CHECK:           %[[VAL_2:.*]] = arith.constant 1 : i32
-// CHECK:           %[[VAL_3:.*]] = arith.addi %[[VAL_2]], %[[VAL_2]] : i32
-// CHECK:           %[[VAL_4:.*]] = arith.muli %[[VAL_3]], %[[VAL_1]] : i32
 // CHECK:           return %[[VAL_2]], %[[VAL_2]] : i32, i32
 // CHECK:         }
-func.func @basic() -> (i32, i32) {
+func.func @basic_constant_fold() -> (i32, i32) {
   %0 = arith.constant 1 : i32
   %1 = arith.constant 1 : i32
   %2 = arith.addi %0, %1 : i32
@@ -85,6 +56,93 @@ func.func @many(f32, f32) -> (f32) {
   return %l : f32
 }
 
+/// TODO: cleanup dead constants
+// CHECK-LABEL:   func.func @cf_constant_fold() -> i32 {
+// CHECK:           %[[VAL_0:.*]] = arith.constant 2 : i32
+// CHECK:           %[[VAL_1:.*]] = arith.constant 1 : i32
+// CHECK:           %[[VAL_2:.*]] = arith.constant true
+// CHECK:           %[[VAL_3:.*]] = arith.constant 0 : i32
+// CHECK:           cf.cond_br %[[VAL_2]], ^bb1, ^bb2
+// CHECK:         ^bb1:
+// CHECK:           cf.br ^bb2
+// CHECK:         ^bb2:
+// CHECK:           return %[[VAL_0]] : i32
+// CHECK:         }
+func.func @cf_constant_fold() -> i32 {
+  %1 = arith.constant 0 : i32
+  %true = arith.constant true
+  cf.cond_br %true, ^bb1, ^bb2(%1 : i32)
+
+  ^bb1:
+
+  %c1_i32 = arith.constant 1 : i32
+  cf.br ^bb2(%c1_i32 : i32)
+
+  ^bb2(%arg : i32):
+
+  %c1_i32_0 = arith.constant 1 : i32
+  %2 = arith.addi %arg, %c1_i32_0 : i32
+  return %2 : i32
+}
+
+/// Sadly mul(a, 0) is not folded to 0 via the fold API
+// CHECK-LABEL:   func.func @control_flow_fold(
+// CHECK-SAME:                                 %[[VAL_0:.*]]: i32) -> i32 {
+// CHECK:           %[[VAL_1:.*]] = arith.constant 0 : i32
+// CHECK:           %[[VAL_2:.*]] = arith.constant false
+// CHECK:           cf.cond_br %[[VAL_2]], ^bb1, ^bb2
+// CHECK:         ^bb1:
+// CHECK:           %[[VAL_3:.*]] = arith.constant 1 : i32
+// CHECK:           cf.br ^bb2
+// CHECK:         ^bb2:
+// CHECK:           %[[VAL_4:.*]] = arith.muli %[[VAL_0]], %[[VAL_1]] : i32
+// CHECK:           return %[[VAL_4]] : i32
+// CHECK:         }
+func.func @control_flow_fold(%arg : i32) -> i32 {
+  %false = arith.constant false
+  %c1_i32_0 = arith.constant 0 : i32
+  cf.cond_br %false, ^bb1, ^bb2(%arg, %c1_i32_0 : i32, i32)
+
+^bb1:
+  %c1_i32 = arith.constant 1 : i32
+  cf.br ^bb2(%c1_i32, %c1_i32 : i32, i32)
+
+^bb2(%arg1 : i32, %arg2: i32):
+  %2 = arith.muli %arg1, %arg2 : i32
+  return %2 : i32
+}
+
+// CHECK-LABEL:   func.func @control_flow_fold2(
+// CHECK-SAME:                                  %[[VAL_0:.*]]: i32) -> i32 {
+// CHECK:           %[[VAL_1:.*]] = arith.constant false
+// CHECK:           cf.cond_br %[[VAL_1]], ^bb2, ^bb1
+// CHECK:         ^bb1:
+// CHECK:           cf.cond_br %[[VAL_1]], ^bb2, ^bb3
+// CHECK:         ^bb2:
+// CHECK:           %[[VAL_2:.*]] = "foo.i1"() : () -> i1
+// CHECK:           %[[VAL_3:.*]] = "foo.i32"() : () -> i32
+// CHECK:           cf.cond_br %[[VAL_2]], ^bb1, ^bb2
+// CHECK:         ^bb3:
+// CHECK:           %[[VAL_4:.*]] = arith.muli %[[VAL_0]], %[[VAL_0]] : i32
+// CHECK:           return %[[VAL_4]] : i32
+// CHECK:         }
+func.func @control_flow_fold2(%arg : i32) -> i32 {
+  %false = arith.constant false
+  cf.cond_br %false, ^bb3, ^bb1(%false, %arg : i1, i32)
+
+^bb1(%c : i1, %a : i32):
+  cf.cond_br %c, ^bb3, ^bb2(%a : i32)
+
+^bb3:
+  %c0 = "foo.i1"() : () -> i1
+  %arg2 = "foo.i32"() : () -> i32
+  cf.cond_br %c0, ^bb1(%c0, %arg2 : i1, i32), ^bb3
+
+^bb2(%arg1 : i32):
+  %2 = arith.muli %arg1, %arg : i32
+  return %2 : i32
+}
+
 // CHECK-LABEL:   func.func @phi1(
 // CHECK-SAME:                    %[[VAL_0:.*]]: i32,
 // CHECK-SAME:                    %[[VAL_1:.*]]: i1,
@@ -120,9 +178,9 @@ func.func @phi1(i32, i1, i1) -> i32 {
 // CHECK:         ^bb1(%[[VAL_4:.*]]: i32):
 // CHECK:           cf.br ^bb2(%[[VAL_3]] : i32)
 // CHECK:         ^bb2(%[[VAL_5:.*]]: i32):
-// CHECK:           cf.cond_br %[[VAL_2]], ^bb1(%[[VAL_5]] : i32), ^bb3(%[[VAL_5]] : i32)
-// CHECK:         ^bb3(%[[VAL_6:.*]]: i32):
-// CHECK:           return %[[VAL_6]] : i32
+// CHECK:           cf.cond_br %[[VAL_2]], ^bb1(%[[VAL_5]] : i32), ^bb3
+// CHECK:         ^bb3:
+// CHECK:           return %[[VAL_5]] : i32
 // CHECK:         }
 func.func @phi2(i32, i1, i1) -> i32 {
 ^bb(%arg : i32, %c0 : i1, %c1 : i1):
@@ -397,6 +455,19 @@ func.func @phi9(i32) -> (i32, i32) {
   func.return %res1, %res2 : i32, i32
 }
 
+/// Check that operations are not eliminated if they have different result
+/// types.
+// CHECK-LABEL: @different_results
+func.func @different_results(%arg0: tensor<*xf32>) -> (tensor<?x?xf32>, tensor<4x?xf32>) {
+  // CHECK: %[[VAR_0:[0-9a-zA-Z_]+]] = tensor.cast %{{.*}} : tensor<*xf32> to tensor<?x?xf32>
+  // CHECK-NEXT: %[[VAR_1:[0-9a-zA-Z_]+]] = tensor.cast %{{.*}} : tensor<*xf32> to tensor<4x?xf32>
+  %0 = tensor.cast %arg0 : tensor<*xf32> to tensor<?x?xf32>
+  %1 = tensor.cast %arg0 : tensor<*xf32> to tensor<4x?xf32>
+
+  // CHECK-NEXT: return %[[VAR_0]], %[[VAR_1]] : tensor<?x?xf32>, tensor<4x?xf32>
+  return %0, %1 : tensor<?x?xf32>, tensor<4x?xf32>
+}
+
 /// The edits GVN did are not really important but this used to crash
 func.func @crash0(%arg0: memref<3x4xf32>, %arg1: memref<4x3xf32>, %arg2: memref<3x3xf32>, %arg3: memref<3x3xf32>) {
   %cst = arith.constant 0.000000e+00 : f32
@@ -490,4 +561,25 @@ func.func @crash0(%arg0: memref<3x4xf32>, %arg1: memref<4x3xf32>, %arg2: memref<
   cf.br ^bb16(%28 : index)
 ^bb21:  // pred: ^bb16
   return
+}
+
+// CHECK-LABEL:   func.func @phi10(
+// CHECK-SAME:                     %[[VAL_0:.*]]: i32,
+// CHECK-SAME:                     %[[VAL_1:.*]]: i32) -> i32 {
+// CHECK:           cf.br ^bb1(%[[VAL_0]], %[[VAL_1]] : i32, i32)
+// CHECK:         ^bb1(%[[VAL_2:.*]]: i32, %[[VAL_3:.*]]: i32):
+// CHECK:           %[[VAL_4:.*]] = "foo.i1"() : () -> i1
+// CHECK:           cf.cond_br %[[VAL_4]], ^bb1(%[[VAL_3]], %[[VAL_2]] : i32, i32), ^bb2
+// CHECK:         ^bb2:
+// CHECK:           return %[[VAL_2]] : i32
+// CHECK:         }
+func.func @phi10(%arg0 : i32, %arg1 : i32) -> i32 {
+cf.br ^bb1(%arg0, %arg1 : i32, i32)
+
+^bb1(%a : i32, %b : i32):
+  %c0 = "foo.i1"() : () -> i1
+  cf.cond_br %c0, ^bb1(%b, %a : i32, i32), ^bb3(%a : i32)
+
+^bb3(%ret : i32):
+  func.return %ret: i32
 }

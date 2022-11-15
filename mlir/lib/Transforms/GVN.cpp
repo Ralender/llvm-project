@@ -26,7 +26,8 @@
 //  - No support for Customizing the GVN behavior around an operation
 //  - It deal with memory pessimistically. assuming every operation that
 //    accesses memory cannot match with anything other then it self.
-//  - Completely ignores predicate informations.
+//  - for now GVN only deduces global informations. not informations that are
+//    true for only part of the cfg
 //  - Lacking phi folding like: phi(op, op) = op(phi, phi)
 //  - A new expression is created every time an Value/Operation is process.
 //    And it is very hard to know that an expression is not used
@@ -135,11 +136,6 @@ public:
   Expr *get() const { return expr; }
 };
 
-/// Found by ADL
-llvm::hash_code hash_value(const ExprOperand &value) {
-  return llvm::hash_value(value.get());
-}
-
 /// expressions in the same congruence class are all kept in thee same intrusive
 /// list. The Congruence class stores this list.
 /// expressions should never use the original in the hash or compare because
@@ -217,21 +213,29 @@ protected:
     if (getOperands().size() != other->getOperands().size())
       return false;
     for (unsigned idx = 0; idx < getOperands().size(); idx++)
-      if (getOperands()[idx].get() != other->getOperands()[idx].get())
+      if (getOperands()[idx].get()->getCurrent() !=
+          other->getOperands()[idx].get()->getCurrent())
         return false;
     return true;
   }
 
   void copyFromImpl(Expr *other) {}
 
+  unsigned computeOperandsHash() {
+    auto hashRange = llvm::map_range(getOperands(), [](ExprOperand elem) {
+      return elem.get()->getCurrent();
+    });
+    return llvm::hash_combine_range(hashRange.begin(), hashRange.end());
+    return hash;
+  }
+
 public:
   void verifyInvariance() {
 #ifndef NDEBUG
     assert(isEqual(this));
-    dispatchToImpl<int>(this, [](auto *expr) {
-      expr->verifyInvarianceImpl();
-      return 0;
-    });
+    assert(original);
+    assert(current);
+    dispatchToImpl(this, [](auto *expr) { expr->verifyInvarianceImpl(); });
 #endif
   }
   struct EmptyTag {};
@@ -269,11 +273,11 @@ public:
   LLVM_DUMP_METHOD void dump() { return print(llvm::errs()); }
 
   /// Dispatch the lambda to the correct subclass of Expr
-  template <typename RetTy, typename T>
+  template <typename RetTy = void, typename T = void>
   static RetTy dispatchToImpl(Expr *expr, T &&callable) {
     return llvm::TypeSwitch<Expr *, RetTy>(expr)
         .template Case<VariableExpr, PHIExpr, GenericOpExpr, ConstExpr,
-                       DeadExpr>(callable);
+                       DeadExpr>(callable).getValue();
   }
 };
 
@@ -307,8 +311,8 @@ class GenericOpExpr : public Expr {
   }
 
   unsigned computeHash() {
-    return llvm::hash_combine(Expr::generic, hashOpAction(getCurrOp()), getCurrIdx(),
-                              getOperands());
+    return llvm::hash_combine(Expr::generic, hashOpAction(getCurrOp()),
+                              getCurrIdx(), computeOperandsHash());
   }
 
 public:
@@ -319,7 +323,6 @@ public:
 
   void verifyInvarianceImpl() {
     assert(hash == computeHash());
-    assert(original);
     Operation *op = cast<OpResult>(getCurrVal()).getOwner();
     assert(op->getNumOperands() == getOperands().size());
   }
@@ -356,8 +359,7 @@ public:
   }
   void verifyInvarianceImpl() {
     assert(hash == computeHash());
-    assert(original);
-    assert(current);
+    assert(getCurrVal());
   }
 };
 
@@ -377,8 +379,6 @@ public:
   bool isEqual(DeadExpr *other) { return true; }
   void verifyInvarianceImpl() {
     assert(hash == computeHash());
-    assert(original);
-    assert(current);
   }
 };
 
@@ -388,7 +388,8 @@ class PHIExpr : public Expr {
   unsigned computeHash() {
     /// PHIs from different blocks may not have the same condition to split the
     /// value. So they cant be considered equal.
-    return llvm::hash_combine(kind, getCurrVal().getParentBlock(), getOperands());
+    return llvm::hash_combine(kind, getCurrVal().getParentBlock(),
+                              computeOperandsHash());
   }
 
 public:
@@ -397,8 +398,6 @@ public:
     assert(operands.size() > 1 && "phi(x) should be x");
     initOperands(operands);
     hash = computeHash();
-    if (hash == 1424709350)
-      dump();
   }
   static bool classof(const Expr *expr) { return expr->getKind() == Expr::phi; }
   bool isEqual(PHIExpr *other) {
@@ -408,7 +407,6 @@ public:
   void verifyInvarianceImpl() {
     assert(hash == computeHash());
     assert(isa<BlockArgument>(original));
-    assert(current);
   }
 };
 
@@ -435,7 +433,6 @@ public:
   void copyFromImpl(ConstExpr *other) { dialect = other->dialect; }
   void verifyInvarianceImpl() {
     assert(hash == computeHash());
-    assert(original);
     assert(getCurrAttr());
   }
 };
@@ -496,10 +493,8 @@ void Expr::copyFrom(Expr *other, Value orig) {
 
   for (unsigned idx = 0; idx < other->getOperands().size(); idx++)
     initOperand(getOperands()[idx], other->getOperands()[idx].get());
-  dispatchToImpl<int>(this, [&](auto *expr) {
-    expr->copyFromImpl((decltype(expr))other);
-    return 0;
-  });
+  dispatchToImpl(
+      this, [&](auto *expr) { expr->copyFromImpl((decltype(expr))other); });
 }
 
 /// Represent a set of Expr that are considered to be congruent.
@@ -520,6 +515,7 @@ struct CongruenceClass : public llvm::ilist_node<CongruenceClass>,
     assert(!members.empty());
     return &members.front();
   }
+  bool isInitial() { return isa<DeadExpr>(getLeader()); }
 
   LLVM_DUMP_METHOD void dump() { print(llvm::errs()); }
   void print(raw_ostream &os);
@@ -568,6 +564,7 @@ void CongruenceClass::print(raw_ostream &os) {
 void Expr::print(raw_ostream &os) {
   os << "Expr ";
   os << getID();
+  os << " " << llvm::utohexstr(hash) << " ";
   os << " " << exprKindToStr(kind) << " ";
   CongruenceClass::printAsValue(os, cClass);
 
@@ -823,6 +820,7 @@ public:
   }
   void set(unsigned idx) { touchedValues.set(idx); }
   void set(ValOrOp val) { set(lookupNum(val)); }
+  void set() { touchedValues.set(); }
   void reset(unsigned idx) { touchedValues.reset(idx); }
   void reset(ValOrOp val) { reset(lookupNum(val)); }
   void set(unsigned begin, unsigned end) {
@@ -868,7 +866,6 @@ struct GVNstate {
   UpdateAndNumberingTracker tracker;
 
   /// NewGVN calls it Top
-  CongruenceClass *initialClass;
   llvm::iplist<CongruenceClass> liveClasses;
   DenseMap<Value, Expr *> valueToExpr;
   void removeFromClass(Expr *expr) {
@@ -917,7 +914,7 @@ struct GVNstate {
   Expr *lookupLeader(Value val) {
     Expr *expr = lookupExpr(val);
     if (expr->cClass) {
-      if (expr->cClass == initialClass)
+      if (isa<DeadExpr>(expr->cClass->getLeader()))
         /// TODO: This should return undef
         return expr;
       return expr->cClass->getLeader();
@@ -932,6 +929,9 @@ struct GVNstate {
 
   Region *region = nullptr;
   DominanceInfo *getDom();
+
+  /// verification
+  void verifyReachedFixpoint();
 
   /// Initialization
   LogicalResult isValidOp(Region &r, Operation *);
@@ -948,6 +948,7 @@ struct GVNstate {
   void iterate();
 
   /// Change the IR
+  Value getConstantFor(ConstExpr* cstExpr);
   void performChanges();
   void cleanup();
 
@@ -987,7 +988,7 @@ void GVNstate::initCongruenceClasses() {
   /// it at the end is dead or undef
   MLIRContext *ctx = region->getContext();
   IRRewriter rewriter(ctx);
-  initialClass = alloc.makeSimple<CongruenceClass>();
+    CongruenceClass *initialClass = alloc.makeSimple<CongruenceClass>();
 
   /// Go through every reachable blocks
   for (Block &b : region->getBlocks()) {
@@ -1020,7 +1021,15 @@ void GVNstate::initCongruenceClasses() {
 }
 
 void GVNstate::updateCongruenceFor(Expr *expr, Value val) {
-  CongruenceClass *currentClass = expr->cClass;
+  CongruenceClass *currentClass = lookupExpr(val)->cClass;
+  Expr* currentExpr = lookupExpr(val);
+  if (currentExpr->isEqual(expr)) {
+    /// Expr has just been built so we have the only reference to it at this
+    /// point. But as soon as it is placed in the map, other expression will start
+    /// depending on it.
+    alloc.deleteObj(expr);
+    return;
+  }
   auto lookupResult = exprMerger.insert({expr, nullptr});
 
   /// There is no match so we create a new congruence class
@@ -1029,9 +1038,8 @@ void GVNstate::updateCongruenceFor(Expr *expr, Value val) {
     lookupResult.first->second = alloc.makeSimple<CongruenceClass>();
   CongruenceClass *newClass = lookupResult.first->second;
 
-  /// If the class has not changed there is nothing left to do.
-  if (currentClass == newClass)
-    return;
+  /// If the class was the same we should have bailed earlier
+  assert(currentClass != newClass);
 
   /// If expr is the current leader of the old class.
   /// For update the old class members
@@ -1051,7 +1059,7 @@ void GVNstate::updateCongruenceFor(Expr *expr, Value val) {
         tracker.set(num);
   updateExpr(expr, val);
 
-  LLVM_DEBUG(llvm::dbgs() << "expr moved to:" << *newClass);
+  LLVM_DEBUG(llvm::dbgs() << "updated:" << *newClass);
 }
 
 void GVNstate::processBlockArg(BlockArgument arg,
@@ -1077,13 +1085,18 @@ void GVNstate::processBlockArg(BlockArgument arg,
     Expr *expr = lookupExpr(operand);
 
     /// initial is undef so: phi(undef, ...) -> phi(...)
-    if (expr->cClass == initialClass)
+    if (expr->cClass->isInitial())
       continue;
 
     exprs.insert(expr);
   }
 
   /// TODO: add more phi folding technics
+
+  if (exprs.empty()) {
+    res.push_back(alloc.makeSimple<DeadExpr>(arg));
+    return;
+  }
 
   /// phi(a) == a
   if (exprs.size() == 1) {
@@ -1095,27 +1108,46 @@ void GVNstate::processBlockArg(BlockArgument arg,
 }
 
 void GVNstate::updateReachableEdge(BlockEdge edge) {
-  if (reachableEdges.insert(edge).second) {
-    NumRange range = tracker.lookupRange(edge.to);
-    if (reachableBlocks.insert(edge.to).second)
+  NumRange range = tracker.lookupRange(edge.to);
+  if (reachableEdges.insert(edge).second)
+    if (reachableBlocks.insert(edge.to).second) {
       /// This block has never been visited so process all block args and ops in
       /// the block
       tracker.set(range.begin, range.end);
-    else
-      /// This block has already been visited only reprocess block arguments
-      tracker.set(range.begin, range.argEnd);
-  }
+      return;
+    }
+  /// This block has already been visited only reprocess block arguments
+  tracker.set(range.begin, range.argEnd);
 }
 
 void GVNstate::processTerminator(Operation *op, SmallVectorImpl<Expr *> &res) {
   assert(op->hasTrait<OpTrait::IsTerminator>());
 
-  /// Update reachability, and touched instructions
-  for (Block *to : op->getSuccessors())
-    updateReachableEdge({op->getBlock(), to});
-
   /// In case the terminator has some results
   processGenericOp(op, res);
+
+  /// Try to constant fold the branch based on current knowledge
+  if (auto br = dyn_cast<BranchOpInterface>(op)) {
+    SmallVector<Attribute> currentConstants;
+
+    /// Try to get constants for every operands
+    for (Value operand : op->getOperands())
+      if (auto* cstExpr = dyn_cast<ConstExpr>(lookupExpr(operand)))
+        currentConstants.push_back(cstExpr->getCurrAttr());
+      else
+        currentConstants.push_back(nullptr);
+
+    /// If the branch gets constant folded. only update reachability the edge
+    /// that got used
+    if (Block *successor = br.getSuccessorForOperands(currentConstants)) {
+      updateReachableEdge({op->getBlock(), successor});
+      return;
+    }
+  }
+
+  /// If constant folding failed, update reachability of every edge.
+  for (Block *to : op->getSuccessors())
+    updateReachableEdge({op->getBlock(), to});
 }
 
 void GVNstate::processGenericOp(Operation *op, SmallVectorImpl<Expr *> &res) {
@@ -1200,6 +1232,43 @@ void GVNstate::processValOrOp(ValOrOp iterable, SmallVectorImpl<Expr *> &res) {
   return processGenericOp(op, res);
 }
 
+void GVNstate::verifyReachedFixpoint() {
+#ifndef NDEBUG
+  LLVM_DEBUG(llvm::dbgs() << "verifying a fixedpoint was reached:\n");
+  /// To verify that we reached a fixpoint:
+  ///  - copy the current mappings
+  ///  - touch everything
+  ///  - rerun the iteration, with all the current information
+  ///  - verify that nothing moved.
+
+  auto valueToExprCopy = valueToExpr;
+  /// congruence class of expressions also need to be tracked
+  DenseMap<Expr*, CongruenceClass*> exprToClassCopy;
+  for (auto valExpr : valueToExprCopy)
+    exprToClassCopy[valExpr.second] = valExpr.second->cClass;
+
+  tracker.set();
+  /// 0 doesn't represent a value, it is used for error detection.
+  tracker.reset(0);
+  /// Also dont process block arguments of the entry block
+  NumRange idxRange = tracker.lookupRange(&region->front());
+  tracker.reset(idxRange.begin, idxRange.argEnd);
+
+  iterate();
+  for (auto valExpr : valueToExprCopy) {
+    Value val = valExpr.first;
+    Expr* oldExpr = valExpr.second;
+    Expr* newExpr = valueToExpr.lookup(val);
+
+    /// New expressions are always created so check for structural equality
+    /// updateCongruenceFor should not replace the expression if it is
+    /// equivalent to the current expression so we can compare pointers here.
+    assert(oldExpr == newExpr);
+    assert(oldExpr->cClass == newExpr->cClass);
+  }
+#endif
+}
+
 void GVNstate::iterate() {
   uint64_t iterations = 0;
 
@@ -1208,6 +1277,10 @@ void GVNstate::iterate() {
   /// While we have work to do
   while (tracker.getTouchedIndexes().any()) {
     LLVM_DEBUG(llvm::dbgs() << "iteration " << iterations << "\n");
+
+    /// This might happens naturally but it is much more likely that it is an
+    /// infinite loop.
+    assert(iterations < 20);
     ++iterations;
 
     /// Go thought every ops we need to process
@@ -1246,6 +1319,26 @@ void GVNstate::iterate() {
   }
 }
 
+Value GVNstate::getConstantFor(ConstExpr *cstExpr) {
+  MLIRContext *ctx = region->getContext();
+  IRRewriter rewriter(ctx);
+  OperationFolder folder(ctx);
+  rewriter.setInsertionPointToStart(&region->front());
+  Value result;
+
+  auto *origOp = cstExpr->getOriginal().getDefiningOp();
+  if (origOp && origOp->hasTrait<OpTrait::ConstantLike>()) {
+    origOp->moveBefore(&region->front().front());
+    result = cstExpr->getOriginal();
+  } else {
+    result = folder.getOrCreateConstant(
+        rewriter, cstExpr->dialect, cstExpr->getCurrAttr(),
+        cstExpr->getOriginal().getType(), cstExpr->getOrigLoc());
+    assert(result && "failed to materialize constant");
+  }
+  return result;
+}
+
 void GVNstate::performChanges() {
   MLIRContext *ctx = region->getContext();
   IRRewriter rewriter(ctx);
@@ -1256,26 +1349,16 @@ void GVNstate::performChanges() {
 
   for (CongruenceClass &cClass : liveClasses) {
     /// TODO: replace initial by undef
-    if (&cClass == initialClass)
+    if (cClass.isInitial())
       continue;
 
     Value replacement = cClass.getLeader()->getCurrVal();
-    if (ConstExpr *cst = dyn_cast<ConstExpr>(cClass.getLeader())) {
-      auto *origOp = cst->getOriginal().getDefiningOp();
-      if (origOp && origOp->hasTrait<OpTrait::ConstantLike>()) {
-        origOp->moveBefore(&region->front().front());
-        replacement = cst->getOriginal();
-      } else {
-        replacement = folder.getOrCreateConstant(
-            rewriter, cst->dialect, cst->getCurrAttr(),
-            cst->getOriginal().getType(), cst->getOrigLoc());
-        assert(replacement && "failed to materialize constant");
-      }
-    }
+    if (ConstExpr *cst = dyn_cast<ConstExpr>(cClass.getLeader()))
+      replacement = getConstantFor(cst);
 
     for (Expr &elem : cClass.members) {
       /// dont replace the leader
-      if (&elem == cClass.getLeader())
+      if (elem.getOriginal() == replacement)
         continue;
 
       /// If the replacement doesn't dominate every use, skip it.
@@ -1333,6 +1416,7 @@ void GVNstate::run() {
   /// The GVN has already been setup for its region at this point
   initCongruenceClasses();
   iterate();
+  verifyReachedFixpoint();
   performChanges();
 
   cleanup();
