@@ -104,7 +104,7 @@ Block *getBlock(ValOrOp voo) {
 
 struct CongruenceClass;
 class Expr;
-class VariableExpr;
+class ExternalExpr;
 class PHIExpr;
 class GenericOpExpr;
 class ConstExpr;
@@ -155,7 +155,7 @@ public:
     phi,
 
     /// Used for external values or as fallback
-    variable,
+    external,
 
     constant,
 
@@ -168,7 +168,7 @@ public:
       // clang-format off
       case generic: return "generic";
       case phi: return "phi";
-      case variable: return "variable";
+      case external: return "external";
       case constant: return "constant";
       case dead: return "dead";
       // clang-format on
@@ -279,7 +279,7 @@ public:
   template <typename RetTy = void, typename T = void>
   static RetTy dispatchToImpl(Expr *expr, T &&callable) {
     return llvm::TypeSwitch<Expr *, RetTy>(expr)
-        .template Case<VariableExpr, PHIExpr, GenericOpExpr, ConstExpr,
+        .template Case<ExternalExpr, PHIExpr, GenericOpExpr, ConstExpr,
                        DeadExpr>(callable).getValue();
   }
 };
@@ -344,20 +344,20 @@ public:
 /// cannot reason about. regions arguments, operations that access memory(since
 /// we dont yet model it). since it is not congruent with any other Expr. it
 /// doesn't need to track what the original operations depended upon.
-class VariableExpr : public Expr {
+class ExternalExpr : public Expr {
   unsigned computeHash() {
-    return llvm::hash_combine(Expr::variable, getCurrent());
+    return llvm::hash_combine(Expr::external, getCurrent());
   }
 
 public:
-  VariableExpr(Value origAndCurrent)
-      : Expr(Expr::variable, origAndCurrent, origAndCurrent) {
+  ExternalExpr(Value origAndCurrent)
+      : Expr(Expr::external, origAndCurrent, origAndCurrent) {
     hash = computeHash();
   }
   static bool classof(const Expr *expr) {
-    return expr->getKind() == Expr::variable;
+    return expr->getKind() == Expr::external;
   }
-  bool isEqual(VariableExpr *other) {
+  bool isEqual(ExternalExpr *other) {
     return getCurrent() == other->getCurrent();
   }
   void verifyInvarianceImpl() {
@@ -643,7 +643,7 @@ class Allocator {
   template <typename T>
   void assertSimple() {
     static_assert(
-        std::is_same_v<CongruenceClass, T> || std::is_same_v<VariableExpr, T> ||
+        std::is_same_v<CongruenceClass, T> || std::is_same_v<ExternalExpr, T> ||
             std::is_same_v<DeadExpr, T> || std::is_same_v<ConstExpr, T>,
         "T must be simple");
   }
@@ -1006,16 +1006,16 @@ void GVNstate::initCongruenceClasses() {
 
   /// Arguments of the region are all unique so they have their own class
   for (BlockArgument &arg : region->front().getArguments()) {
-    Expr *expr = alloc.makeSimple<VariableExpr>(arg);
+    Expr *expr = alloc.makeSimple<ExternalExpr>(arg);
     valueToExpr[arg] = expr;
     addToClass(expr, alloc.makeSimple<CongruenceClass>());
     LLVM_DEBUG(llvm::dbgs() << "arg expr:" << *expr << "\n");
   }
 
   /// We cant analyses values coming from outside the region. so we all put them
-  /// into variable class
+  /// into external class
   for (Value val : externalValues) {
-    Expr *expr = alloc.makeSimple<VariableExpr>(val);
+    Expr *expr = alloc.makeSimple<ExternalExpr>(val);
     valueToExpr[val] = expr;
     addToClass(expr, alloc.makeSimple<CongruenceClass>());
     LLVM_DEBUG(llvm::dbgs() << "external operand:" << *expr << "\n");
@@ -1157,7 +1157,7 @@ void GVNstate::processGenericOp(Operation *op, SmallVectorImpl<Expr *> &res) {
   /// fallback for now
   if (!MemoryEffectOpInterface::hasNoEffect(op)) {
     for (Value val : op->getResults())
-      res.push_back(alloc.makeSimple<VariableExpr>(val));
+      res.push_back(alloc.makeSimple<ExternalExpr>(val));
     return;
   }
 
@@ -1198,7 +1198,7 @@ void GVNstate::processGenericOp(Operation *op, SmallVectorImpl<Expr *> &res) {
         temporaries.push_back(newOp);
         return processGenericOp(newOp, res);
       }
-      /// Folded to a constant or variable, so we dont need to keep the
+      /// Folded to a constant or external, so we dont need to keep the
       /// operation around
       LLVM_DEBUG(llvm::dbgs() << "folded: \"" << *op << "\" to:";
                  for (OpFoldResult val
