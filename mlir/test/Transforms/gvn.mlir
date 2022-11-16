@@ -583,3 +583,35 @@ cf.br ^bb1(%arg0, %arg1 : i32, i32)
 ^bb3(%ret : i32):
   func.return %ret: i32
 }
+
+/// This does not IR edits, just check that regions are handled properly
+// CHECK-LABEL:   func.func @check_regions() {
+// CHECK:           %[[VAL_0:.*]] = arith.constant 0.000000e+00 : f32
+// CHECK:           %[[VAL_1:.*]] = memref.alloc() : memref<10xf32>
+// CHECK:           affine.for %[[VAL_2:.*]] = 0 to 10 {
+// CHECK:             affine.store %[[VAL_0]], %[[VAL_1]]{{\[}}%[[VAL_2]]] : memref<10xf32>
+// CHECK:           }
+// CHECK:           affine.for %[[VAL_3:.*]] = 0 to 5 {
+// CHECK:             affine.for %[[VAL_4:.*]] = 0 to 10 {
+// CHECK:               %[[VAL_5:.*]] = affine.load %[[VAL_1]]{{\[}}%[[VAL_4]]] : memref<10xf32>
+// CHECK:               affine.store %[[VAL_5]], %[[VAL_1]]{{\[}}%[[VAL_4]]] : memref<10xf32>
+// CHECK:             }
+// CHECK:           }
+// CHECK:           return
+// CHECK:         }
+func.func @check_regions() {
+  %a = memref.alloc() : memref<10xf32>
+
+  %cf0 = arith.constant 0.0 : f32
+  affine.for %i0 = 0 to 10 {
+    affine.store %cf0, %a[%i0] : memref<10xf32>
+  }
+
+  affine.for %i1 = 0 to 5 {
+    affine.for %i2 = 0 to 10 {
+      %v0 = affine.load %a[%i2] : memref<10xf32>
+      affine.store %v0, %a[%i2] : memref<10xf32>
+    }
+  }
+  return
+}

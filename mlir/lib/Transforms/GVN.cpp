@@ -18,7 +18,6 @@
 //    list.
 // It has a few limitation:
 //  - /!\\ It is greatly under tested for now /!\\.
-//  - It cannot handle structured control-flow.
 //  - It does not yet handle associative operations like it should.
 //  - The leader selection is cheap but often not optimal.
 //  - IR editing is still basic. no sinking, hoisting or localized replacement.
@@ -35,6 +34,10 @@
 //    or ref-counting. so expressions are not deleted until the GVN is done.
 //    this means that memory usage might be high when GVN needs many iterations
 //    until it reaches the fixed-point.
+//  - GVN currently analyses regions one by one and not all together.
+//    This maybe suboptimal. This is because GVN requires a full CFG to operate.
+//    And it feels weird build a virtual CFG over structured control-flow when
+//    this is literal a lowering step that will be performed.
 //
 // It could be a good idea to split GVN into the Analysis part that find the
 // congruence classes and the IR editing part based of the found classes
@@ -622,10 +625,7 @@ struct GVNstate;
 struct GVNPass : public impl::GVNBase<GVNPass> {
   DominanceInfo *domInfo = nullptr;
 
-  GVNstate *s = nullptr;
-  GVNstate &getState() { return *s; }
-
-  LogicalResult processOp(Operation *op);
+  void processOp(Operation *op);
   void runOnOperation() override;
 };
 
@@ -925,7 +925,14 @@ struct GVNstate {
   /// Reachability tacking
   llvm::SmallDenseSet<Block *, 1> reachableBlocks;
   DenseSet<BlockEdge> reachableEdges;
+
   SmallVector<Operation *> temporaries;
+  /// Values coming from outside of the basic regions.
+  /// These values cannot be analyzed
+  /// The same Value may be used more then once but we want to build it only
+  /// once. Maybe we could a use a vector here since the only change would be
+  /// the order of a few debug prints.
+  llvm::SmallSetVector<Value, 4> externalValues;
 
   Region *region = nullptr;
   DominanceInfo *getDom();
@@ -934,8 +941,7 @@ struct GVNstate {
   void verifyReachedFixpoint();
 
   /// Initialization
-  LogicalResult isValidOp(Region &r, Operation *);
-  LogicalResult setupFor(Region &r);
+  void setupFor(Region &r);
   void initCongruenceClasses();
 
   /// Iteration
@@ -953,19 +959,6 @@ struct GVNstate {
   void cleanup();
 
   void run();
-};
-
-/// RAII Scope to swap GVNstate
-class Scope {
-  GVNstate s;
-  llvm::SaveAndRestore<GVNstate *> restore;
-
-public:
-  Scope(GVNPass &g) : s(g), restore(g.s, &s) {}
-  ~Scope() {
-    assert(s.global.s == &s);
-    s.run();
-  }
 };
 
 LLVM_DUMP_METHOD void Allocator::dump() {
@@ -1018,6 +1011,15 @@ void GVNstate::initCongruenceClasses() {
     addToClass(expr, alloc.makeSimple<CongruenceClass>());
     LLVM_DEBUG(llvm::dbgs() << "arg expr:" << *expr << "\n");
   }
+
+  /// We cant analyses values coming from outside the region. so we all put them
+  /// into variable class
+  for (Value val : externalValues) {
+    Expr *expr = alloc.makeSimple<VariableExpr>(val);
+    valueToExpr[val] = expr;
+    addToClass(expr, alloc.makeSimple<CongruenceClass>());
+    LLVM_DEBUG(llvm::dbgs() << "external operand:" << *expr << "\n");
+  }
 }
 
 void GVNstate::updateCongruenceFor(Expr *expr, Value val) {
@@ -1055,6 +1057,7 @@ void GVNstate::updateCongruenceFor(Expr *expr, Value val) {
     if (operand.getOwner()->getParentRegion() == region)
       /// Unreachable code is not in tracked but can still use our values
       /// So we skip if the lookup returns 0, 0 means not tracked so unreachable
+      /// This will also skip Uses outside of the current region
       if (unsigned num = tracker.lookupNumOr0(operand.getOwner()))
         tracker.set(num);
   updateExpr(expr, val);
@@ -1422,25 +1425,17 @@ void GVNstate::run() {
   cleanup();
 }
 
-LogicalResult GVNstate::isValidOp(Region &r, Operation *o) {
-  for (Value val : o->getOperands()) {
-    if (val.getParentRegion() != &r) {
-      o->emitError("def outside of region");
-      return failure();
-    }
-    for (OpOperand &use : val.getUses()) {
-      if (use.getOwner()->getParentRegion() != &r) {
-        o->emitError("use outside of region");
-        return failure();
-      }
-    }
-  }
-  return success();
-}
-
-LogicalResult GVNstate::setupFor(Region &r) {
+void GVNstate::setupFor(Region &r) {
   UpdateAndNumberingTracker::Builder builder(tracker);
   /// Block arguments are used to present PHI nodes.
+
+  auto checkForExternalValues = [&](Operation &op) {
+    /// Values with defs outside of the regions need special handling so we
+    /// list them here.
+    for (Value val : op.getOperands())
+      if (val.getParentRegion() != &r)
+        externalValues.insert(val);
+  };
 
   /// For some reason Dominator tree doest work for block with only one block
   /// Se here is our fallback
@@ -1454,8 +1449,7 @@ LogicalResult GVNstate::setupFor(Region &r) {
       builder.assignNumbering(arg);
     builder.endArgs();
     for (Operation &op : r.front().getOperations()) {
-      if (failed(isValidOp(r, &op)))
-        return failure();
+      checkForExternalValues(op);
       builder.assignNumbering(&op);
     }
     builder.endBlock(&r.front());
@@ -1486,10 +1480,9 @@ LogicalResult GVNstate::setupFor(Region &r) {
       for (BlockArgument &arg : b->getArguments())
         builder.assignNumbering(arg);
       builder.endArgs();
-      for (Operation &o : b->getOperations()) {
-        if (failed(isValidOp(r, &o)))
-          return failure();
-        builder.assignNumbering(&o);
+      for (Operation &op : b->getOperations()) {
+        checkForExternalValues(op);
+        builder.assignNumbering(&op);
       }
 
       builder.endBlock(b);
@@ -1511,31 +1504,27 @@ LogicalResult GVNstate::setupFor(Region &r) {
 
   /// Touch all operation results not block arguments
   tracker.set(range.argEnd, range.end);
-  return success();
 }
 
 DominanceInfo *GVNstate::getDom() { return global.domInfo; }
 GVNstate::GVNstate(GVNPass &g) : global(g) {}
 
-LogicalResult GVNPass::processOp(Operation *op) {
+void GVNPass::processOp(Operation *op) {
   for (Region &r : op->getRegions()) {
     {
-      Scope scope(*this);
-      if (failed(getState().setupFor(r)))
-        return failure();
+      GVNstate state(*this);
+      state.setupFor(r);
+      state.run();
     }
     for (Block &b : r.getBlocks())
       for (Operation &o : b.getOperations())
-        if (failed(processOp(&o)))
-          return failure();
+        processOp(&o);
   }
-  return success();
 }
 
 void GVNPass::runOnOperation() {
   domInfo = &getAnalysis<DominanceInfo>();
-  if (failed(processOp(getOperation())))
-    signalPassFailure();
+  processOp(getOperation());
 }
 
 } // namespace gvn
