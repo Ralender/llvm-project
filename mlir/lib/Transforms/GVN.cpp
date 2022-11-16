@@ -10,9 +10,9 @@
 // NewGVN. But it uses different data structures:
 //  - Expressions keep pointers on there original value, current representation
 //    and current class so there is no need for hash map to keep track of it
-//  - Expressions are kept in a intrusive with other expressions in the same
-//    congruence class this way moving expressions between classes (which is
-//    very frequent) is cheap.
+//  - Expressions are kept in a intrusive list with other expressions in the
+//    same congruence class this way moving expressions between classes (which
+//    is very frequent) is cheap.
 //  - Expression and there operands are allocated in one consecutive block
 //  - The leader of a congruence class is the first expressions in the intrusive
 //    list.
