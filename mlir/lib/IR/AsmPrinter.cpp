@@ -25,6 +25,7 @@
 #include "mlir/IR/MLIRContext.h"
 #include "mlir/IR/OpImplementation.h"
 #include "mlir/IR/Operation.h"
+#include "mlir/IR/PrinterHook.h"
 #include "mlir/IR/SubElementInterfaces.h"
 #include "mlir/IR/Verifier.h"
 #include "llvm/ADT/APFloat.h"
@@ -2718,8 +2719,10 @@ public:
   using Impl = AsmPrinter::Impl;
   using Impl::printType;
 
-  explicit OperationPrinter(raw_ostream &os, AsmStateImpl &state)
-      : Impl(os, state), OpAsmPrinter(static_cast<Impl &>(*this)) {}
+  explicit OperationPrinter(raw_ostream &os, AsmStateImpl &state,
+                            PrinterHookBase *hook = nullptr)
+      : Impl(os, state), OpAsmPrinter(static_cast<Impl &>(*this)),
+        annotationHook(hook) {}
 
   /// Print the given top-level operation.
   void printTopLevelOperation(Operation *op);
@@ -2905,6 +2908,9 @@ private:
 
   // This is the current indentation level for nested structures.
   unsigned currentIndent = 0;
+
+  /// Hook to print annotations before or after blocks and operations
+  PrinterHookBase *annotationHook;
 };
 } // namespace
 
@@ -3010,6 +3016,9 @@ void OperationPrinter::printRegionArgument(BlockArgument arg,
 }
 
 void OperationPrinter::printFullOpWithIndentAndLoc(Operation *op) {
+  if (annotationHook)
+    annotationHook->printCommentBeforeOp(op, os, currentIndent);
+
   // Track the location of this operation.
   state.registerOperationLocation(op, newLine.curLine, currentIndent);
 
@@ -3194,6 +3203,10 @@ void OperationPrinter::printBlockName(Block *block) {
 
 void OperationPrinter::print(Block *block, bool printBlockArgs,
                              bool printBlockTerminator) {
+
+  if (annotationHook)
+    annotationHook->printCommentBeforeBlock(block, os, currentIndent);
+
   // Print the block label and argument list if requested.
   if (printBlockArgs) {
     os.indent(currentIndent);
@@ -3491,8 +3504,8 @@ void Operation::print(raw_ostream &os, const OpPrintingFlags &printerFlags) {
   AsmState state(op, printerFlags);
   print(os, state);
 }
-void Operation::print(raw_ostream &os, AsmState &state) {
-  OperationPrinter printer(os, state.getImpl());
+void Operation::print(raw_ostream &os, AsmState &state, PrinterHookBase *hook) {
+  OperationPrinter printer(os, state.getImpl(), hook);
   if (!getParent() && !state.getPrinterFlags().shouldUseLocalScope()) {
     state.getImpl().initializeAliases(this);
     printer.printTopLevelOperation(this);
@@ -3519,8 +3532,8 @@ void Block::print(raw_ostream &os) {
   AsmState state(parentOp);
   print(os, state);
 }
-void Block::print(raw_ostream &os, AsmState &state) {
-  OperationPrinter(os, state.getImpl()).print(this);
+void Block::print(raw_ostream &os, AsmState &state, PrinterHookBase *hook) {
+  OperationPrinter(os, state.getImpl(), hook).print(this);
 }
 
 void Block::dump() { print(llvm::errs()); }
@@ -3539,3 +3552,5 @@ void Block::printAsOperand(raw_ostream &os, AsmState &state) {
   OperationPrinter printer(os, state.getImpl());
   printer.printBlockName(this);
 }
+
+PrinterHookBase::~PrinterHookBase() = default;

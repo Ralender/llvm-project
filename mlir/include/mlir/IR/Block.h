@@ -13,6 +13,7 @@
 #ifndef MLIR_IR_BLOCK_H
 #define MLIR_IR_BLOCK_H
 
+#include "mlir/IR/PrinterHook.h"
 #include "mlir/IR/BlockSupport.h"
 #include "mlir/IR/Visitors.h"
 
@@ -336,7 +337,7 @@ public:
   }
 
   void print(raw_ostream &os);
-  void print(raw_ostream &os, AsmState &state);
+  void print(raw_ostream &os, AsmState &state, PrinterHookBase *hook = nullptr);
   void dump();
 
   /// Print out the name of the block without printing its body.
