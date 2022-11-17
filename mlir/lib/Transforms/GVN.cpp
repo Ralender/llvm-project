@@ -22,7 +22,6 @@
 //  - The leader selection is cheap but often not optimal.
 //  - IR editing is still basic. no sinking, hoisting or localized replacement.
 //  - Self validation should be pushed further
-//  - No support for Customizing the GVN behavior around an operation
 //  - It deal with memory pessimistically. assuming every operation that
 //    accesses memory cannot match with anything other then it self.
 //  - for now GVN only deduces global informations. not informations that are
@@ -52,7 +51,7 @@
 #include "mlir/IR/PatternMatch.h"
 #include "mlir/IR/Value.h"
 #include "mlir/Interfaces/ControlFlowInterfaces.h"
-#include "mlir/Interfaces/LoopLikeInterface.h"
+#include "mlir/Interfaces/GvnOpInterface.h"
 #include "mlir/Interfaces/SideEffectInterfaces.h"
 #include "mlir/Transforms/FoldUtils.h"
 #include "mlir/Transforms/Passes.h"
@@ -85,7 +84,7 @@ struct BlockEdge {
   Block *to;
 };
 
-using ValOrOp = llvm::PointerUnion<Value, Operation *>;
+using ValOrOp = PointerUnion<Value, Operation *>;
 
 llvm::raw_ostream &operator<<(llvm::raw_ostream &os, ValOrOp voo) {
   if (auto val = voo.dyn_cast<Value>())
@@ -106,6 +105,7 @@ class Expr;
 class ExternalExpr;
 class PHIExpr;
 class GenericOpExpr;
+class CostumeExpr;
 class ConstExpr;
 class DeadExpr;
 
@@ -158,6 +158,9 @@ public:
 
     constant,
 
+    /// This represent an operations which as a GvnOpInterface
+    custom,
+
     /// Represent an unreachable value, all dead expression are considered
     /// equals
     dead,
@@ -169,6 +172,7 @@ public:
       case phi: return "phi";
       case external: return "external";
       case constant: return "constant";
+      case custom: return "custom";
       case dead: return "dead";
       // clang-format on
     }
@@ -258,6 +262,9 @@ public:
   CongruenceClass *getParent() { return cClass; }
   unsigned getHash() { return hash; }
   Value getOriginal() { return original; }
+  PointerUnion<Attribute, Value> getCurrPointerUnion() {
+    return *static_cast<PointerUnion<Attribute, Value> *>(&current);
+  }
   OpFoldResult getCurrent() { return current; }
   Value getCurrVal() { return current.dyn_cast<Value>(); }
   Operation *getCurrOp() {
@@ -338,6 +345,47 @@ public:
         getCurrIdx() != other->getCurrIdx())
       return false;
     return isOperandEqual(other);
+  }
+};
+
+class CostumeExpr : public Expr {
+  GvnOpInterface interface;
+  unsigned computeHash() {
+    if (!isUsingProperHash)
+      return 0;
+    return llvm::hash_combine(Expr::custom,
+                              interface.computeOperationActionHash(
+                                  getCurrOp(), computeOperandsHash()),
+                              getCurrIdx());
+  }
+
+public:
+  CostumeExpr(ArrayRef<Expr *> operands, Value orig, Value current, GvnOpInterface interface)
+      : Expr(Expr::custom, orig, current, operands), interface(interface) {
+    hash = computeHash();
+  }
+
+  void verifyInvarianceImpl() {
+    assert(hash == computeHash());
+    Operation *op = cast<OpResult>(getCurrVal()).getOwner();
+    assert(op->getNumOperands() == getOperands().size());
+  }
+  static bool classof(const Expr *expr) {
+    return expr->getKind() == Expr::generic;
+  }
+  bool isEqual(CostumeExpr *other) {
+    if (!isOperandEqual(other))
+      return false;
+    SmallVector<PointerUnion<Attribute, Value>> lhsOperands(
+        llvm::map_range(other->getOperands(), [](const ExprOperand &expr) {
+          return expr.get()->getCurrPointerUnion();
+        }));
+    SmallVector<PointerUnion<Attribute, Value>> rhsOperands(
+        llvm::map_range(getOperands(), [](const ExprOperand &expr) {
+          return expr.get()->getCurrPointerUnion();
+        }));
+    return interface.isOperationActionEqual(getCurrOp(), other->getCurrOp(),
+                                            lhsOperands, rhsOperands);
   }
 };
 
@@ -1258,8 +1306,11 @@ void GVNstate::processGenericOp(Operation *op, SmallVectorImpl<Expr *> &res) {
     newOp->erase();
   }
 
-  for (OpResult v : op->getResults())
+  for (OpResult v : op->getResults()) {
+    if (auto gvnInterface = dyn_cast<GvnOpInterface>(op))
+      res.push_back(alloc.makeComplex<CostumeExpr>(exprs, v, v, gvnInterface));
     res.push_back(alloc.makeComplex<GenericOpExpr>(exprs, v, v));
+  }
 }
 
 void GVNstate::processValOrOp(ValOrOp iterable, SmallVectorImpl<Expr *> &res) {
@@ -1560,6 +1611,7 @@ void GVNPass::processOp(Operation *op) {
 }
 
 void GVNPass::runOnOperation() {
+  isUsingProperHash = hashCollisions;
   domInfo = &getAnalysis<DominanceInfo>();
   processOp(getOperation());
 }
