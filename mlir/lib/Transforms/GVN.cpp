@@ -45,6 +45,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "mlir/IR/Dominance.h"
+#include "mlir/IR/AsmState.h"
 #include "mlir/IR/Matchers.h"
 #include "mlir/IR/OpDefinition.h"
 #include "mlir/IR/Operation.h"
@@ -937,6 +938,8 @@ struct GVNstate {
   Region *region = nullptr;
   DominanceInfo *getDom();
 
+  LLVM_DUMP_METHOD void dump();
+
   /// verification
   void verifyReachedFixpoint();
 
@@ -974,6 +977,28 @@ LLVM_DUMP_METHOD void Allocator::dump() {
       elem->dump();
       llvm::errs() << "\n";
     }
+}
+
+LLVM_DUMP_METHOD void GVNstate::dump() {
+  AsmState asmState(region->getParentOp());
+  struct PrinterHook final : PrinterHookBase {
+    GVNstate *state;
+    void printCommentBeforeOp(Operation *op, raw_ostream &os,
+                              unsigned currentIndent) override {
+      if (op->getParentRegion() != state->region)
+        return;
+      for (OpResult val : op->getResults()) {
+        os.indent(currentIndent);
+        os << "// res " << val.getResultNumber() << " ";
+        state->lookupExpr(val)->print(os);
+        os << "\n";
+      }
+    }
+    void printCommentBeforeBlock(Block *block, raw_ostream &os,
+                                 unsigned currentIndent) override {}
+  } printHook;
+  printHook.state = this;
+  region->getParentOp()->print(llvm::errs(), asmState, &printHook);
 }
 
 void GVNstate::initCongruenceClasses() {
