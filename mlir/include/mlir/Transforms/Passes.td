@@ -83,7 +83,11 @@ def GVN : Pass<"gvn"> {
     still experimental
   }];
   let constructor = "mlir::createGVNPass()";
-  let statistics = [
+  let options = [
+    Option<"hashCollisions", "hash-collide", "bool", "false", 
+    "Instead of using proper hashes the GVN will use only 0 as "
+    "hashes. This is intended to test the comparator which is "
+    "rarely tested with incorrect values in normal operation">
   ];
 }
 

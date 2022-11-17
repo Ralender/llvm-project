@@ -1,4 +1,5 @@
 // RUN: mlir-opt -allow-unregistered-dialect %s -pass-pipeline='builtin.module(func.func(gvn))' | FileCheck %s
+// RUN: mlir-opt -allow-unregistered-dialect %s -pass-pipeline='builtin.module(func.func(gvn{hash-collide=1}))' | FileCheck %s
 
 // CHECK-LABEL:   func.func @basic_constant_fold() -> (i32, i32) {
 // CHECK:           %[[VAL_0:.*]] = arith.constant 4 : i32

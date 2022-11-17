@@ -50,12 +50,10 @@
 #include "mlir/IR/OpDefinition.h"
 #include "mlir/IR/Operation.h"
 #include "mlir/IR/PatternMatch.h"
-#include "mlir/IR/UseDefLists.h"
 #include "mlir/IR/Value.h"
 #include "mlir/Interfaces/ControlFlowInterfaces.h"
 #include "mlir/Interfaces/LoopLikeInterface.h"
 #include "mlir/Interfaces/SideEffectInterfaces.h"
-#include "mlir/Support/TypeID.h"
 #include "mlir/Transforms/FoldUtils.h"
 #include "mlir/Transforms/Passes.h"
 #include "llvm/ADT/BitVector.h"
@@ -68,8 +66,6 @@
 #include "llvm/ADT/StringExtras.h"
 #include "llvm/ADT/TypeSwitch.h"
 #include "llvm/Support/ArrayRecycler.h"
-#include "llvm/Support/SaveAndRestore.h"
-#include "llvm/Support/TrailingObjects.h"
 
 namespace mlir {
 #define GEN_PASS_DEF_GVN
@@ -81,6 +77,8 @@ namespace mlir {
 using namespace mlir;
 
 namespace {
+
+thread_local bool isUsingProperHash;
 
 struct BlockEdge {
   Block *from;
@@ -270,7 +268,7 @@ public:
   Attribute getCurrAttr() { return current.dyn_cast<Attribute>(); }
   bool isEqual(Expr *other);
 
-  /// Used for clonning expression
+  /// Used for cloning expression
   void copyFrom(Expr *other, Value original);
   void print(raw_ostream &os);
   void printAsValue(raw_ostream &os) { os << "Expr(" << getID() << ")"; }
@@ -315,6 +313,8 @@ class GenericOpExpr : public Expr {
   }
 
   unsigned computeHash() {
+    if (!isUsingProperHash)
+      return 0;
     return llvm::hash_combine(Expr::generic, hashOpAction(getCurrOp()),
                               getCurrIdx(), computeOperandsHash());
   }
@@ -347,6 +347,8 @@ public:
 /// doesn't need to track what the original operations depended upon.
 class ExternalExpr : public Expr {
   unsigned computeHash() {
+    if (!isUsingProperHash)
+      return 0;
     return llvm::hash_combine(Expr::external, getCurrent());
   }
 
@@ -370,7 +372,11 @@ public:
 /// Represent a Value with an undef value. At the start every value is
 /// represented by a DeadExpr.
 class DeadExpr : public Expr {
-  unsigned computeHash() { return llvm::hash_value(Expr::dead); }
+  unsigned computeHash() {
+    if (!isUsingProperHash)
+      return 0;
+    return llvm::hash_value(Expr::dead);
+  }
 
 public:
   DeadExpr(Value origAndCurrent)
@@ -390,6 +396,8 @@ public:
 /// represented by a PHIExpr is a BlockArgument, no an OpResult.
 class PHIExpr : public Expr {
   unsigned computeHash() {
+    if (!isUsingProperHash)
+      return 0;
     /// PHIs from different blocks may not have the same condition to split the
     /// value. So they cant be considered equal.
     return llvm::hash_combine(kind, getCurrVal().getParentBlock(),
@@ -417,7 +425,11 @@ public:
 /// Represent a constant. The constants are represented with attributes instead
 /// of Values
 class ConstExpr : public Expr {
-  unsigned computeHash() { return llvm::hash_combine(kind, getCurrAttr()); }
+  unsigned computeHash() {
+    if (!isUsingProperHash)
+      return 0;
+    return llvm::hash_combine(kind, getCurrAttr());
+  }
 
 public:
   /// Keep track of the dialect such that the constant can get materialized
