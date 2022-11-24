@@ -77,7 +77,7 @@ using namespace mlir;
 
 namespace {
 
-thread_local bool isUsingProperHash;
+thread_local bool triggerHashCollisions;
 
 struct BlockEdge {
   Block *from;
@@ -320,7 +320,7 @@ class GenericOpExpr : public Expr {
   }
 
   unsigned computeHash() {
-    if (!isUsingProperHash)
+    if (triggerHashCollisions)
       return 0;
     return llvm::hash_combine(Expr::generic, hashOpAction(getCurrOp()),
                               getCurrIdx(), computeOperandsHash());
@@ -351,7 +351,7 @@ public:
 class CostumeExpr : public Expr {
   GvnOpInterface interface;
   unsigned computeHash() {
-    if (!isUsingProperHash)
+    if (triggerHashCollisions)
       return 0;
     return llvm::hash_combine(Expr::custom,
                               interface.computeOperationActionHash(
@@ -367,7 +367,7 @@ public:
 
   void verifyInvarianceImpl() {
     assert(hash == computeHash());
-    Operation *op = cast<OpResult>(getCurrVal()).getOwner();
+    [[maybe_unused]] Operation *op = cast<OpResult>(getCurrVal()).getOwner();
     assert(op->getNumOperands() == getOperands().size());
   }
   static bool classof(const Expr *expr) {
@@ -395,7 +395,7 @@ public:
 /// doesn't need to track what the original operations depended upon.
 class ExternalExpr : public Expr {
   unsigned computeHash() {
-    if (!isUsingProperHash)
+    if (triggerHashCollisions)
       return 0;
     return llvm::hash_combine(Expr::external, getCurrent());
   }
@@ -421,7 +421,7 @@ public:
 /// represented by a DeadExpr.
 class DeadExpr : public Expr {
   unsigned computeHash() {
-    if (!isUsingProperHash)
+    if (triggerHashCollisions)
       return 0;
     return llvm::hash_value(Expr::dead);
   }
@@ -444,7 +444,7 @@ public:
 /// represented by a PHIExpr is a BlockArgument, no an OpResult.
 class PHIExpr : public Expr {
   unsigned computeHash() {
-    if (!isUsingProperHash)
+    if (triggerHashCollisions)
       return 0;
     /// PHIs from different blocks may not have the same condition to split the
     /// value. So they cant be considered equal.
@@ -474,7 +474,7 @@ public:
 /// of Values
 class ConstExpr : public Expr {
   unsigned computeHash() {
-    if (!isUsingProperHash)
+    if (triggerHashCollisions)
       return 0;
     return llvm::hash_combine(kind, getCurrAttr());
   }
@@ -1611,7 +1611,7 @@ void GVNPass::processOp(Operation *op) {
 }
 
 void GVNPass::runOnOperation() {
-  isUsingProperHash = hashCollisions;
+  triggerHashCollisions = hashCollisions;
   domInfo = &getAnalysis<DominanceInfo>();
   processOp(getOperation());
 }
