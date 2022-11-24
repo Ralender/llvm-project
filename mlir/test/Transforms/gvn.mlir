@@ -470,6 +470,86 @@ func.func @different_results(%arg0: tensor<*xf32>) -> (tensor<?x?xf32>, tensor<4
 }
 
 /// The edits GVN did are not really important but this used to crash
+// CHECK-LABEL:   func.func @crash0(
+// CHECK-SAME:                      %[[VAL_0:.*]]: memref<3x4xf32>,
+// CHECK-SAME:                      %[[VAL_1:.*]]: memref<4x3xf32>,
+// CHECK-SAME:                      %[[VAL_2:.*]]: memref<3x3xf32>,
+// CHECK-SAME:                      %[[VAL_3:.*]]: memref<3x3xf32>) {
+// CHECK:           %[[VAL_4:.*]] = arith.constant 4 : index
+// CHECK:           %[[VAL_5:.*]] = arith.constant 1 : index
+// CHECK:           %[[VAL_6:.*]] = arith.constant 3 : index
+// CHECK:           %[[VAL_7:.*]] = arith.constant 0 : index
+// CHECK:           %[[VAL_8:.*]] = arith.constant 0.000000e+00 : f32
+// CHECK:           %[[VAL_9:.*]] = memref.alloc() : memref<3x3xf32>
+// CHECK:           cf.br ^bb1(%[[VAL_7]] : index)
+// CHECK:         ^bb1(%[[VAL_10:.*]]: index):
+// CHECK:           %[[VAL_11:.*]] = arith.cmpi slt, %[[VAL_10]], %[[VAL_6]] : index
+// CHECK:           cf.cond_br %[[VAL_11]], ^bb2, ^bb6
+// CHECK:         ^bb2:
+// CHECK:           cf.br ^bb3(%[[VAL_7]] : index)
+// CHECK:         ^bb3(%[[VAL_12:.*]]: index):
+// CHECK:           %[[VAL_13:.*]] = arith.cmpi slt, %[[VAL_12]], %[[VAL_6]] : index
+// CHECK:           cf.cond_br %[[VAL_13]], ^bb4, ^bb5
+// CHECK:         ^bb4:
+// CHECK:           memref.store %[[VAL_8]], %[[VAL_9]]{{\[}}%[[VAL_10]], %[[VAL_12]]] : memref<3x3xf32>
+// CHECK:           %[[VAL_14:.*]] = arith.addi %[[VAL_12]], %[[VAL_5]] : index
+// CHECK:           cf.br ^bb3(%[[VAL_14]] : index)
+// CHECK:         ^bb5:
+// CHECK:           %[[VAL_15:.*]] = arith.addi %[[VAL_10]], %[[VAL_5]] : index
+// CHECK:           cf.br ^bb1(%[[VAL_15]] : index)
+// CHECK:         ^bb6:
+// CHECK:           cf.br ^bb7(%[[VAL_7]] : index)
+// CHECK:         ^bb7(%[[VAL_16:.*]]: index):
+// CHECK:           %[[VAL_17:.*]] = arith.cmpi slt, %[[VAL_16]], %[[VAL_6]] : index
+// CHECK:           cf.cond_br %[[VAL_17]], ^bb8, ^bb15
+// CHECK:         ^bb8:
+// CHECK:           cf.br ^bb9(%[[VAL_7]] : index)
+// CHECK:         ^bb9(%[[VAL_18:.*]]: index):
+// CHECK:           %[[VAL_19:.*]] = arith.cmpi slt, %[[VAL_18]], %[[VAL_6]] : index
+// CHECK:           cf.cond_br %[[VAL_19]], ^bb10, ^bb14
+// CHECK:         ^bb10:
+// CHECK:           cf.br ^bb11(%[[VAL_7]] : index)
+// CHECK:         ^bb11(%[[VAL_20:.*]]: index):
+// CHECK:           %[[VAL_21:.*]] = arith.cmpi slt, %[[VAL_20]], %[[VAL_4]] : index
+// CHECK:           cf.cond_br %[[VAL_21]], ^bb12, ^bb13
+// CHECK:         ^bb12:
+// CHECK:           %[[VAL_22:.*]] = memref.load %[[VAL_1]]{{\[}}%[[VAL_20]], %[[VAL_18]]] : memref<4x3xf32>
+// CHECK:           %[[VAL_23:.*]] = memref.load %[[VAL_0]]{{\[}}%[[VAL_16]], %[[VAL_20]]] : memref<3x4xf32>
+// CHECK:           %[[VAL_24:.*]] = arith.mulf %[[VAL_23]], %[[VAL_22]] : f32
+// CHECK:           %[[VAL_25:.*]] = memref.load %[[VAL_9]]{{\[}}%[[VAL_16]], %[[VAL_18]]] : memref<3x3xf32>
+// CHECK:           %[[VAL_26:.*]] = arith.addf %[[VAL_25]], %[[VAL_24]] : f32
+// CHECK:           memref.store %[[VAL_26]], %[[VAL_9]]{{\[}}%[[VAL_16]], %[[VAL_18]]] : memref<3x3xf32>
+// CHECK:           %[[VAL_27:.*]] = arith.addi %[[VAL_20]], %[[VAL_5]] : index
+// CHECK:           cf.br ^bb11(%[[VAL_27]] : index)
+// CHECK:         ^bb13:
+// CHECK:           %[[VAL_28:.*]] = arith.addi %[[VAL_18]], %[[VAL_5]] : index
+// CHECK:           cf.br ^bb9(%[[VAL_28]] : index)
+// CHECK:         ^bb14:
+// CHECK:           %[[VAL_29:.*]] = arith.addi %[[VAL_16]], %[[VAL_5]] : index
+// CHECK:           cf.br ^bb7(%[[VAL_29]] : index)
+// CHECK:         ^bb15:
+// CHECK:           cf.br ^bb16(%[[VAL_7]] : index)
+// CHECK:         ^bb16(%[[VAL_30:.*]]: index):
+// CHECK:           %[[VAL_31:.*]] = arith.cmpi slt, %[[VAL_30]], %[[VAL_6]] : index
+// CHECK:           cf.cond_br %[[VAL_31]], ^bb17, ^bb21
+// CHECK:         ^bb17:
+// CHECK:           cf.br ^bb18(%[[VAL_7]] : index)
+// CHECK:         ^bb18(%[[VAL_32:.*]]: index):
+// CHECK:           %[[VAL_33:.*]] = arith.cmpi slt, %[[VAL_32]], %[[VAL_6]] : index
+// CHECK:           cf.cond_br %[[VAL_33]], ^bb19, ^bb20
+// CHECK:         ^bb19:
+// CHECK:           %[[VAL_34:.*]] = memref.load %[[VAL_2]]{{\[}}%[[VAL_30]], %[[VAL_32]]] : memref<3x3xf32>
+// CHECK:           %[[VAL_35:.*]] = memref.load %[[VAL_9]]{{\[}}%[[VAL_30]], %[[VAL_32]]] : memref<3x3xf32>
+// CHECK:           %[[VAL_36:.*]] = arith.addf %[[VAL_35]], %[[VAL_34]] : f32
+// CHECK:           memref.store %[[VAL_36]], %[[VAL_3]]{{\[}}%[[VAL_30]], %[[VAL_32]]] : memref<3x3xf32>
+// CHECK:           %[[VAL_37:.*]] = arith.addi %[[VAL_32]], %[[VAL_5]] : index
+// CHECK:           cf.br ^bb18(%[[VAL_37]] : index)
+// CHECK:         ^bb20:
+// CHECK:           %[[VAL_38:.*]] = arith.addi %[[VAL_30]], %[[VAL_5]] : index
+// CHECK:           cf.br ^bb16(%[[VAL_38]] : index)
+// CHECK:         ^bb21:
+// CHECK:           return
+// CHECK:         }
 func.func @crash0(%arg0: memref<3x4xf32>, %arg1: memref<4x3xf32>, %arg2: memref<3x3xf32>, %arg3: memref<3x3xf32>) {
   %cst = arith.constant 0.000000e+00 : f32
   %alloc = memref.alloc() : memref<3x3xf32>
@@ -615,4 +695,31 @@ func.func @check_regions() {
     }
   }
   return
+}
+
+// CHECK-LABEL:   llvm.func @fold_inplace() {
+// CHECK:           %[[VAL_0:.*]] = "foo.op"() : () -> !llvm.ptr<i8>
+// CHECK:           %[[VAL_1:.*]] = llvm.mlir.constant(0 : i32) : i32
+// CHECK:           %[[VAL_2:.*]] = llvm.mlir.constant(0 : i32) : i32
+// CHECK:           %[[VAL_3:.*]] = "foo.op"() : () -> !llvm.ptr<struct<"class.std::ios_base::Init", (i8)>>
+// CHECK:           %[[VAL_4:.*]] = llvm.getelementptr %[[VAL_3]]{{\[}}%[[VAL_2]], 0] : (!llvm.ptr<struct<"class.std::ios_base::Init", (i8)>>, i32) -> !llvm.ptr<i8>
+// CHECK:           %[[VAL_5:.*]] = "foo.op"() : () -> !llvm.ptr<func<void (ptr<struct<"class.std::ios_base::Init", (i8)>>)>>
+// CHECK:           %[[VAL_6:.*]] = llvm.bitcast %[[VAL_5]] : !llvm.ptr<func<void (ptr<struct<"class.std::ios_base::Init", (i8)>>)>> to !llvm.ptr<func<void (ptr<i8>)>>
+// CHECK:           %[[VAL_7:.*]] = "foo.op"() : () -> !llvm.ptr<struct<"class.std::ios_base::Init", (i8)>>
+// CHECK:           "foo.op"(%[[VAL_7]]) : (!llvm.ptr<struct<"class.std::ios_base::Init", (i8)>>) -> ()
+// CHECK:           %[[VAL_8:.*]] = "foo.op"(%[[VAL_6]], %[[VAL_4]], %[[VAL_0]]) : (!llvm.ptr<func<void (ptr<i8>)>>, !llvm.ptr<i8>, !llvm.ptr<i8>) -> i32
+// CHECK:           llvm.return
+// CHECK:         }
+llvm.func @fold_inplace() {
+  %0 = "foo.op"() : () -> !llvm.ptr<i8>
+  %1 = llvm.mlir.constant(0 : i32) : i32
+  %2 = llvm.mlir.constant(0 : i32) : i32
+  %3 = "foo.op"() : () -> !llvm.ptr<struct<"class.std::ios_base::Init", (i8)>>
+  %4 = llvm.getelementptr %3[%2, 0] : (!llvm.ptr<struct<"class.std::ios_base::Init", (i8)>>, i32) -> !llvm.ptr<i8>
+  %5 = "foo.op"() : () ->  !llvm.ptr<func<void (ptr<struct<"class.std::ios_base::Init", (i8)>>)>>
+  %6 = llvm.bitcast %5 : !llvm.ptr<func<void (ptr<struct<"class.std::ios_base::Init", (i8)>>)>> to !llvm.ptr<func<void (ptr<i8>)>>
+  %7 = "foo.op"() : () ->  !llvm.ptr<struct<"class.std::ios_base::Init", (i8)>>
+  "foo.op"(%7) : (!llvm.ptr<struct<"class.std::ios_base::Init", (i8)>>) -> ()
+  %8 = "foo.op"(%6, %4, %0) : (!llvm.ptr<func<void (ptr<i8>)>>, !llvm.ptr<i8>, !llvm.ptr<i8>) -> i32
+  llvm.return
 }

@@ -347,8 +347,7 @@ public:
 
   void verifyInvarianceImpl() {
     assert(hash == computeHash());
-    Operation *op = cast<OpResult>(getCurrVal()).getOwner();
-    assert(op->getNumOperands() == getOperands().size());
+    [[maybe_unused]] Operation *op = cast<OpResult>(getCurrVal()).getOwner();
   }
   static bool classof(const Expr *expr) {
     return expr->getKind() == Expr::generic;
@@ -615,7 +614,7 @@ raw_ostream &operator<<(raw_ostream &os, Expr &expr) {
   return os;
 }
 
-raw_ostream &operator<<(raw_ostream &os, CongruenceClass &expr) {
+[[maybe_unused]] raw_ostream &operator<<(raw_ostream &os, CongruenceClass &expr) {
   expr.print(os);
   return os;
 }
@@ -926,8 +925,11 @@ public:
 /// Local information about the GVN pass. there is one of these per operation
 /// isolatedFromAbove
 struct GVNstate {
-  GVNstate(GVNPass &);
+  GVNstate(GVNPass &, MLIRContext*);
   GVNPass &global;
+
+  IRRewriter rewriter;
+  OperationFolder folder;
 
   Allocator alloc;
   UpdateAndNumberingTracker tracker;
@@ -940,6 +942,7 @@ struct GVNstate {
     expr->cClass->members.remove(expr);
     /// Cleanup the class if it is now empty
     if (expr->cClass->members.empty()) {
+      exprMerger.erase(expr);
       liveClasses.remove(expr->cClass);
       alloc.deleteObj(expr->cClass);
     }
@@ -993,7 +996,6 @@ struct GVNstate {
   llvm::SmallDenseSet<Block *, 1> reachableBlocks;
   DenseSet<BlockEdge> reachableEdges;
 
-  SmallVector<Operation *> temporaries;
   /// Values coming from outside of the basic regions.
   /// These values cannot be analyzed
   /// The same Value may be used more then once but we want to build it only
@@ -1072,8 +1074,6 @@ LLVM_DUMP_METHOD void GVNstate::dump() {
 void GVNstate::initCongruenceClasses() {
   /// Create the default class. This GVN is optimistic so everything left inside
   /// it at the end is dead or undef
-  MLIRContext *ctx = region->getContext();
-  IRRewriter rewriter(ctx);
   CongruenceClass *initialClass = alloc.makeSimple<CongruenceClass>();
 
   /// Add every Value to the initialClass
@@ -1297,7 +1297,7 @@ void GVNstate::processGenericOp(Operation *op, SmallVectorImpl<Expr *> &res) {
                  << " \"" << val << "\"";
                  llvm::dbgs() << "\n");
 
-      newOp->erase();
+      rewriter.eraseOp(newOp);
       for (unsigned idx = 0; idx < foldResult.size(); idx++) {
         if (Value val = foldResult[idx].dyn_cast<Value>())
           res.push_back(
@@ -1309,7 +1309,7 @@ void GVNstate::processGenericOp(Operation *op, SmallVectorImpl<Expr *> &res) {
       }
       return;
     }
-    newOp->erase();
+    rewriter.eraseOp(newOp);
   }
 
   for (OpResult v : op->getResults()) {
@@ -1416,9 +1416,6 @@ void GVNstate::iterate() {
 }
 
 Value GVNstate::getConstantFor(ConstExpr *cstExpr) {
-  MLIRContext *ctx = region->getContext();
-  IRRewriter rewriter(ctx);
-  OperationFolder folder(ctx);
   rewriter.setInsertionPointToStart(&region->front());
   Value result;
 
@@ -1436,9 +1433,6 @@ Value GVNstate::getConstantFor(ConstExpr *cstExpr) {
 }
 
 void GVNstate::performChanges() {
-  MLIRContext *ctx = region->getContext();
-  IRRewriter rewriter(ctx);
-  OperationFolder folder(ctx);
   rewriter.setInsertionPointToStart(&region->front());
   llvm::SmallPtrSet<Operation *, 16> tryCleanupOp;
   llvm::SmallPtrSet<BlockArgument, 16> cleanupBlockArg;
@@ -1608,7 +1602,8 @@ void GVNstate::setupFor(Region &r) {
 }
 
 DominanceInfo *GVNstate::getDom() { return global.domInfo; }
-GVNstate::GVNstate(GVNPass &g) : global(g) {}
+GVNstate::GVNstate(GVNPass &g, MLIRContext *ctx)
+    : global(g), rewriter(ctx), folder(ctx) {}
 
 void GVNPass::processOp(Operation *op) {
   for (Region &r : op->getRegions())
@@ -1616,7 +1611,7 @@ void GVNPass::processOp(Operation *op) {
       if (op->getContext()
               ->getDebugActionManager()
               .shouldExecute<GVNProcessRegion>()) {
-        GVNstate state(*this);
+        GVNstate state(*this, op->getContext());
         state.setupFor(r);
         state.run();
       }
