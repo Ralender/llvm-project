@@ -53,6 +53,8 @@
 #include "mlir/Interfaces/ControlFlowInterfaces.h"
 #include "mlir/Interfaces/GvnOpInterface.h"
 #include "mlir/Interfaces/SideEffectInterfaces.h"
+#include "mlir/Support/DebugAction.h"
+#include "mlir/Support/DebugCounter.h"
 #include "mlir/Transforms/FoldUtils.h"
 #include "mlir/Transforms/Passes.h"
 #include "llvm/ADT/BitVector.h"
@@ -76,6 +78,12 @@ namespace mlir {
 using namespace mlir;
 
 namespace {
+
+struct GVNProcessRegion : public DebugAction<GVNProcessRegion> {
+  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(GVNProcessRegion)
+  static StringRef getTag() { return "mlir-gvn-process-region"; }
+  static StringRef getDescription() { return ""; }
+};
 
 thread_local bool triggerHashCollisions;
 
@@ -1603,16 +1611,19 @@ DominanceInfo *GVNstate::getDom() { return global.domInfo; }
 GVNstate::GVNstate(GVNPass &g) : global(g) {}
 
 void GVNPass::processOp(Operation *op) {
-  for (Region &r : op->getRegions()) {
+  for (Region &r : op->getRegions())
     if (!r.empty()) {
-      GVNstate state(*this);
-      state.setupFor(r);
-      state.run();
+      if (op->getContext()
+              ->getDebugActionManager()
+              .shouldExecute<GVNProcessRegion>()) {
+        GVNstate state(*this);
+        state.setupFor(r);
+        state.run();
+      }
+      for (Block &b : r.getBlocks())
+        for (Operation &o : b.getOperations())
+          processOp(&o);
     }
-    for (Block &b : r.getBlocks())
-      for (Operation &o : b.getOperations())
-        processOp(&o);
-  }
 }
 
 void GVNPass::runOnOperation() {
