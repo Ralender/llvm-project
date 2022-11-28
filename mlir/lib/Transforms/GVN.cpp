@@ -290,6 +290,13 @@ public:
   }
 };
 
+#ifndef NDEBUG
+#define MLIR_GVN_MAYBE_TRIGGER_HASH_COLLISION if (triggerHashCollisions) return 0
+#else
+#define MLIR_GVN_MAYBE_TRIGGER_HASH_COLLISION
+#endif
+
+
 /// Represent any generic operation(except constants) that can be merged to an
 /// other expression with the same calculation
 class GenericOpExpr : public Expr {
@@ -320,8 +327,6 @@ class GenericOpExpr : public Expr {
   }
 
   unsigned computeHash() {
-    if (triggerHashCollisions)
-      return 0;
     return llvm::hash_combine(Expr::generic, hashOpAction(getCurrOp()),
                               getCurrIdx(), computeOperandsHash());
   }
@@ -351,8 +356,7 @@ public:
 class CostumeExpr : public Expr {
   GvnOpInterface interface;
   unsigned computeHash() {
-    if (triggerHashCollisions)
-      return 0;
+    MLIR_GVN_MAYBE_TRIGGER_HASH_COLLISION;
     return llvm::hash_combine(Expr::custom,
                               interface.computeOperationActionHash(
                                   getCurrOp(), computeOperandsHash()),
@@ -395,8 +399,7 @@ public:
 /// doesn't need to track what the original operations depended upon.
 class ExternalExpr : public Expr {
   unsigned computeHash() {
-    if (triggerHashCollisions)
-      return 0;
+    MLIR_GVN_MAYBE_TRIGGER_HASH_COLLISION;
     return llvm::hash_combine(Expr::external, getCurrent());
   }
 
@@ -421,8 +424,7 @@ public:
 /// represented by a DeadExpr.
 class DeadExpr : public Expr {
   unsigned computeHash() {
-    if (triggerHashCollisions)
-      return 0;
+    MLIR_GVN_MAYBE_TRIGGER_HASH_COLLISION;
     return llvm::hash_value(Expr::dead);
   }
 
@@ -444,8 +446,7 @@ public:
 /// represented by a PHIExpr is a BlockArgument, no an OpResult.
 class PHIExpr : public Expr {
   unsigned computeHash() {
-    if (triggerHashCollisions)
-      return 0;
+    MLIR_GVN_MAYBE_TRIGGER_HASH_COLLISION;
     /// PHIs from different blocks may not have the same condition to split the
     /// value. So they cant be considered equal.
     return llvm::hash_combine(kind, getCurrVal().getParentBlock(),
@@ -474,8 +475,7 @@ public:
 /// of Values
 class ConstExpr : public Expr {
   unsigned computeHash() {
-    if (triggerHashCollisions)
-      return 0;
+    MLIR_GVN_MAYBE_TRIGGER_HASH_COLLISION;
     return llvm::hash_combine(kind, getCurrAttr());
   }
 
@@ -692,8 +692,6 @@ struct GVNPass : public impl::GVNBase<GVNPass> {
 
 /// The factory for expressions and CongruenceClasses
 class Allocator {
-  unsigned exprID = 1;
-  unsigned classID = 1;
   llvm::BumpPtrAllocator allocator;
   llvm::ArrayRecycler<Expr> recycler;
   using alloc_capacity = llvm::ArrayRecycler<Expr>::Capacity;
@@ -717,30 +715,24 @@ class Allocator {
   }
 
 #ifndef NDEBUG
+  unsigned exprID = 1;
+  unsigned classID = 1;
   Expr *assignID(Expr *expr) {
     assert(expr->getID() == 0);
     expr->setID(exprID++);
-    exprs.push_back(expr);
+    exprs.insert(expr);
     return expr;
   }
   CongruenceClass *assignID(CongruenceClass *cClass) {
     assert(cClass->getID() == 0);
     cClass->setID(classID++);
-    classes.push_back(cClass);
+    classes.insert(cClass);
     return cClass;
   }
-  void remove(Expr *expr) {
-    for (Expr *&elem : exprs)
-      if (elem == expr)
-        elem = nullptr;
-  }
-  void remove(CongruenceClass *cClass) {
-    for (CongruenceClass *&elem : classes)
-      if (elem == cClass)
-        elem = nullptr;
-  }
-  SmallVector<Expr *> exprs;
-  SmallVector<CongruenceClass *> classes;
+  void remove(Expr *expr) { exprs.erase(expr); }
+  void remove(CongruenceClass *cClass) { classes.erase(cClass); }
+  DenseSet<Expr *> exprs;
+  DenseSet<CongruenceClass *> classes;
 #endif
 public:
   template <typename T, typename... Ts>
@@ -757,8 +749,9 @@ public:
 #ifndef NDEBUG
     remove(ptr);
 #endif
-    ptr->~T();
-    recycler.deallocate(alloc_capacity::get(allocSize), (Expr *)ptr);
+    /// removing deletion gives good speedup
+    // ptr->~T();
+    // recycler.deallocate(alloc_capacity::get(allocSize), (Expr *)ptr);
   }
   template <typename T, typename... Ts>
   T *makeComplex(ArrayRef<Expr *> operands, Ts &&...ts) {
@@ -827,9 +820,9 @@ class UpdateAndNumberingTracker {
   /// Each Block argument and operation has a bit in this vector for wether or
   /// not it needs to get updated
   BitVector touchedValues;
-  DenseMap<ValOrOp, unsigned> valOrOpToNum;
+  llvm::SmallDenseMap<ValOrOp, unsigned, 32> valOrOpToNum;
   SmallVector<ValOrOp, 32> numToValOrOp;
-  DenseMap<Block *, NumRange> blockOpRange;
+  llvm::SmallDenseMap<Block *, NumRange, 8> blockOpRange;
 
 public:
   /// Used to setup the tracker
@@ -843,6 +836,11 @@ public:
     unsigned edgeCounter = 0;
     Builder(UpdateAndNumberingTracker &i) : impl(i) {
       impl.numToValOrOp.emplace_back(nullptr);
+    }
+    void reserve(unsigned valCount) {
+      impl.numToValOrOp.reserve(valCount);
+      impl.touchedValues.reserve(valCount);
+      impl.valOrOpToNum.reserve(valCount);
     }
     void startBlock() { currentBlock.begin = valCounter; }
     void endArgs() { currentBlock.argEnd = valCounter; }
@@ -966,11 +964,11 @@ struct GVNstate {
     /// add expr to the new class
     newClass->members.push_back(expr);
     expr->cClass = newClass;
-    exprMerger[expr] = expr->cClass;
   }
 
   /// Expr* is not hash and compared based on its pointer but based on the
   /// content of the Expr
+  /// Any access to this map is expensive.
   DenseMap<Expr *, CongruenceClass *, DenseMapExprUniquer> exprMerger;
   Expr *lookupLeader(Value val) {
     Expr *expr = lookupExpr(val);
@@ -1025,6 +1023,7 @@ struct GVNstate {
 };
 
 LLVM_DUMP_METHOD void Allocator::dump() {
+#ifndef NDEBUG
   llvm::errs() << "classes (" << classes.size() << "):\n";
   for (CongruenceClass *cClass : classes)
     if (cClass) {
@@ -1037,6 +1036,7 @@ LLVM_DUMP_METHOD void Allocator::dump() {
       elem->dump();
       llvm::errs() << "\n";
     }
+#endif
 }
 
 LLVM_DUMP_METHOD void GVNstate::dump() {
@@ -1066,18 +1066,25 @@ void GVNstate::initCongruenceClasses() {
   /// it at the end is dead or undef
   MLIRContext *ctx = region->getContext();
   IRRewriter rewriter(ctx);
-    CongruenceClass *initialClass = alloc.makeSimple<CongruenceClass>();
+  CongruenceClass *initialClass = alloc.makeSimple<CongruenceClass>();
+
+  /// Add every Value to the initialClass
+  /// Since all dead expression are considered equal, we need to add them only
+  /// once to the map.
+  bool hasBeenAddedToExprMerger = false;
+  auto add = [&](Value val) {
+    Expr *expr = valueToExpr[val] = alloc.makeSimple<DeadExpr>(val);
+    if (!hasBeenAddedToExprMerger) {
+      exprMerger[expr] = initialClass;
+      hasBeenAddedToExprMerger = true;
+    }
+    addToClass(expr, initialClass);
+  };
 
   /// Go through every reachable blocks
   for (Block &b : region->getBlocks()) {
     if (!getDom()->isReachableFromEntry(&b))
       continue;
-
-    /// Add every Value to the initialClass
-    auto add = [&](Value val) {
-      Expr *expr = valueToExpr[val] = alloc.makeSimple<DeadExpr>(val);
-      addToClass(expr, initialClass);
-    };
 
     /// the entry block doesn't have block arguments because there is no edges
     /// coming into it.
@@ -1108,8 +1115,8 @@ void GVNstate::initCongruenceClasses() {
 }
 
 void GVNstate::updateCongruenceFor(Expr *expr, Value val) {
-  CongruenceClass *currentClass = lookupExpr(val)->cClass;
   Expr* currentExpr = lookupExpr(val);
+  CongruenceClass *currentClass = currentExpr->cClass;
   if (currentExpr->isEqual(expr)) {
     /// Expr has just been built so we have the only reference to it at this
     /// point. But as soon as it is placed in the map, other expression will start
@@ -1268,21 +1275,12 @@ void GVNstate::processGenericOp(Operation *op, SmallVectorImpl<Expr *> &res) {
 
   /// Dont try to fold if it has a region
   if (!op->getNumRegions()) {
-
     Operation *newOp = op->clone();
     /// Update operands with known information from the GVN
     newOp->setOperands(inputs);
 
     SmallVector<OpFoldResult> foldResult;
-    if (succeeded(newOp->fold(constInput, foldResult))) {
-      if (foldResult.empty()) {
-        /// Folded to an updated operation
-        assert(false && "this path is still un tested");
-        LLVM_DEBUG(llvm::dbgs()
-                   << "folded: \"" << *op << "\" to: \"" << newOp << "\"\n");
-        temporaries.push_back(newOp);
-        return processGenericOp(newOp, res);
-      }
+    if (succeeded(newOp->fold(constInput, foldResult)) && !foldResult.empty()) {
       /// Folded to a constant or external, so we dont need to keep the
       /// operation around
       LLVM_DEBUG(llvm::dbgs() << "folded: \"" << *op << "\" to:";
@@ -1405,7 +1403,6 @@ void GVNstate::iterate() {
         for (unsigned idx = 0; idx < op->getNumResults(); idx++)
           updateCongruenceFor(results[idx], op->getResult(idx));
       }
-      alloc.verifyInvariance();
     }
   }
 }
@@ -1525,6 +1522,14 @@ void GVNstate::setupFor(Region &r) {
         externalValues.insert(val);
   };
 
+  unsigned valueCounter = 0;
+  for (Block &b : r.getBlocks()) {
+    valueCounter += b.getNumArguments();
+    for (Operation &op : b.getOperations())
+      valueCounter += op.getNumResults();
+  }
+  builder.reserve(valueCounter);
+
   /// For some reason Dominator tree doest work for block with only one block
   /// Se here is our fallback
   if (r.hasOneBlock()) {
@@ -1599,7 +1604,7 @@ GVNstate::GVNstate(GVNPass &g) : global(g) {}
 
 void GVNPass::processOp(Operation *op) {
   for (Region &r : op->getRegions()) {
-    {
+    if (!r.empty()) {
       GVNstate state(*this);
       state.setupFor(r);
       state.run();
