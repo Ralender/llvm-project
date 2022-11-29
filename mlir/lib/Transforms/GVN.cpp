@@ -17,7 +17,7 @@
 //  - The leader of a congruence class is the first expressions in the intrusive
 //    list.
 // It has a few limitation:
-//  - /!\\ It is greatly under tested for now /!\\.
+//  - not as heavily tested as I would like.
 //  - It does not yet handle associative operations like it should.
 //  - The leader selection is cheap but often not optimal.
 //  - IR editing is still basic. no sinking, hoisting or localized replacement.
@@ -27,6 +27,11 @@
 //  - for now GVN only deduces global informations. not informations that are
 //    true for only part of the cfg
 //  - Lacking phi folding like: phi(op, op) = op(phi, phi)
+//  - When folding with the current knowledge of the GVN, the op is cloned then
+//    the operands of the clone are replaced with the current knowledge and
+//    finally the fold is called on the clone. all this is expensive and it is
+//    on the hot path of the GVN. it cost 25-30% of the runtime of the GVN.
+//  - GVN doesn't not use the results of in-place folds.
 //  - A new expression is created every time an Value/Operation is process.
 //    And it is very hard to know that an expression is not used
 //    anymore, because expression use other expression without any use tracking
@@ -129,7 +134,7 @@ public:
 #ifndef NDEBUG
     return id;
 #else
-    return 0;
+    llvm_unreachable("getID should not be called in release mode");
 #endif
   }
 #ifndef NDEBUG
