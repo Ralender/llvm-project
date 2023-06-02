@@ -58,6 +58,7 @@ add_llvm_component_library(LLVMScalarOpts
   MergedLoadStoreMotion.cpp
   NaryReassociate.cpp
   NewGVN.cpp
+  ObfuscateCF.cpp
   PartiallyInlineLibCalls.cpp
   PlaceSafepoints.cpp
   Reassociate.cpp
