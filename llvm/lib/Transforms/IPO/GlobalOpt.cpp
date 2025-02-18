@@ -45,6 +45,7 @@
 #include "llvm/IR/Instruction.h"
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/IntrinsicInst.h"
+#include "llvm/IR/MDBuilder.h"
 #include "llvm/IR/Module.h"
 #include "llvm/IR/Operator.h"
 #include "llvm/IR/Type.h"
@@ -2498,6 +2499,102 @@ OptimizeGlobalAliases(Module &M,
   return Changed;
 }
 
+static bool AddRangeMetadata(Module &M) {
+  const DataLayout &DL = M.getDataLayout();
+  bool Changed = false;
+
+  for (GlobalValue &Global : M.global_values()) {
+
+    auto *GV = dyn_cast<GlobalVariable>(&Global);
+    if (!GV || !GV->hasDefinitiveInitializer())
+      continue;
+
+    // To be able to go to the next GlobalVariable with a return
+    [&] {
+      uint64_t GlobalByteSize = DL.getTypeAllocSize(GV->getValueType());
+      unsigned BW = DL.getIndexTypeSizeInBits(GV->getType());
+
+      SmallVector<LoadInst *> ArrayLikeLoads;
+      Type *ElemTy = nullptr;
+
+      for (User *U : GV->users()) {
+        if (auto *GEP = dyn_cast<GetElementPtrInst>(U)) {
+          Type *GEPElemTy = GEP->getResultElementType();
+          if (!GEP->isInBounds() || !GEPElemTy->isIntegerTy())
+            continue;
+
+          // This restriction that all accesses use the same type could be
+          // lifted
+          if (!ElemTy)
+            ElemTy = GEPElemTy;
+          else if (ElemTy != GEPElemTy)
+            return;
+
+          SmallMapVector<Value *, APInt, 4> Index;
+          APInt CstOffset(BW, 0);
+          GEP->collectOffset(DL, BW, Index, CstOffset);
+
+          // This check is needed for correctness of the code below.
+          // Be we could only traverse the range starting at the constant offset
+          if (!CstOffset.isAligned(DL.getPrefTypeAlign(GEPElemTy)))
+            return;
+
+          // The restriction that this is a 1D array could be lifted
+          if (Index.size() != 1 ||
+              Index.front().second != DL.getTypeAllocSize(GEPElemTy))
+            return;
+
+          for (User *U : GEP->users()) {
+            if (auto *LI = dyn_cast<LoadInst>(U)) {
+              // This restriction that all accesses use the same type could be
+              // lifted
+              if (LI->getType() == GEPElemTy)
+                ArrayLikeLoads.push_back(LI);
+              else
+                return;
+            }
+          }
+        }
+      }
+
+      if (ArrayLikeLoads.empty())
+        return;
+
+      APInt Idx = APInt::getZero(64);
+      APInt Min = APInt::getSignedMaxValue(
+          ArrayLikeLoads[0]->getType()->getIntegerBitWidth());
+      APInt Max = APInt::getSignedMinValue(
+          ArrayLikeLoads[0]->getType()->getIntegerBitWidth());
+
+      uint64_t ElemSize = DL.getTypeStoreSize(ArrayLikeLoads[0]->getType());
+      uint64_t NumElem =
+          GlobalByteSize / DL.getTypeStoreSize(ArrayLikeLoads[0]->getType());
+      for (uint64_t i = 0; i < NumElem; i++) {
+        Constant *Cst = ConstantFoldLoadFromConstPtr(
+            GV, ArrayLikeLoads[0]->getType(), Idx, DL);
+
+        if (!Cst)
+          return;
+
+        Idx += ElemSize;
+
+        // MD_range data is expected in signed order, so we use smin and smax
+        // here
+        Min = APIntOps::smin(Min, Cst->getUniqueInteger());
+        Max = APIntOps::smax(Max, Cst->getUniqueInteger());
+      }
+
+      llvm::MDBuilder MDHelper(M.getContext());
+      // The Range is allowed to wrap
+      llvm::MDNode *RNode = MDHelper.createRange(Min, Max + 1);
+      for (LoadInst *LI : ArrayLikeLoads)
+        LI->setMetadata(LLVMContext::MD_range, RNode);
+      Changed = true;
+    }();
+  }
+  return Changed;
+}
+
 static Function *
 FindAtExitLibFunc(Module &M,
                   function_ref<TargetLibraryInfo &(Function &)> GetTLI,
@@ -2886,6 +2983,10 @@ optimizeGlobalsInModule(Module &M, const DataLayout &DL,
 
     Changed |= LocalChange;
   }
+
+  // Add range metadata to loads from constant global variables based on the
+  // values that could be loaded from the variable
+  Changed |= AddRangeMetadata(M);
 
   // TODO: Move all global ctors functions to the end of the module for code
   // layout.
